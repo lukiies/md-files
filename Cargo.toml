@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/md-core",
+    "crates/md2html",
+    "crates/md2docx",
+    "crates/mdread",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+authors = ["Lukasz Robak"]
+repository = "https://github.com/lukiies/md-files"
+
+[workspace.dependencies]
+md-core = { path = "crates/md-core" }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "debuginfo"

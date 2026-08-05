@@ -1,0 +1,11 @@
+[package]
+name = "md2docx"
+description = "Markdown to docx converter (pandoc front-end with sane defaults)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "md2docx"
+path = "src/main.rs"

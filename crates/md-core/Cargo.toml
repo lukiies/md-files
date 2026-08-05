@@ -1,0 +1,10 @@
+[package]
+name = "md-core"
+description = "Shared markdown-to-HTML engine for the md-files tool suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+pulldown-cmark = { workspace = true }

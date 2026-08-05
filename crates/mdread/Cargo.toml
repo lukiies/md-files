@@ -1,0 +1,20 @@
+[package]
+name = "mdread"
+description = "Fast cross-platform Markdown reader with multi-file link navigation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mdread"
+path = "src/main.rs"
+
+[dependencies]
+md-core = { workspace = true }
+wry = "0.56"
+tao = "0.36"
+rfd = "0.17"
+dark-light = "2"
+open = "5"
+dirs = "6"
