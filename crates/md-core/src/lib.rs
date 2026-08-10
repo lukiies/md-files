@@ -48,6 +48,7 @@ pub enum AssetMode {
 }
 
 /// Everything [`render`] needs to know about the document's surroundings.
+#[derive(Default)]
 pub struct RenderOptions<'a> {
     /// Folder the document's relative paths resolve against. `None` leaves
     /// image and link destinations untouched (plain conversion for a browser).
@@ -61,12 +62,6 @@ pub struct RenderOptions<'a> {
     /// navigation scheme while external links stay untouched.
     #[allow(clippy::type_complexity)]
     pub md_link_rewrite: Option<&'a dyn Fn(&Path, Option<&str>) -> String>,
-}
-
-impl<'a> Default for RenderOptions<'a> {
-    fn default() -> Self {
-        Self { base_dir: None, doc_url_base: None, md_link_rewrite: None }
-    }
 }
 
 /// A rendered document body plus the folder its file references live under.
@@ -649,6 +644,142 @@ input[type="checkbox"] {{
     )
 }
 
+/// What [`strip_source_notes`] removed and what it found along the way.
+pub struct StrippedSource {
+    /// The document with every source-only annotation removed.
+    pub text: String,
+    /// A `[TABLE OF CONTENTS]` marker note was present (the deliverable
+    /// should carry a table of contents at that point).
+    pub wants_toc: bool,
+    /// A `[TABLE OF FIGURES]` marker note was present.
+    pub wants_figures_list: bool,
+    /// A `[LIST OF TABLES]` marker note was present.
+    pub wants_tables_list: bool,
+}
+
+/// Strip source-only annotations from a markdown document.
+///
+/// Implements the source/deliverable convention: the `.md` file is the
+/// editable SOURCE and may carry visible working notes; the converted output
+/// is the DELIVERABLE and must not contain them. Removed:
+///
+/// * emoji-blockquote notes — a blockquote whose first line starts with a
+///   character outside Latin-1 (`> 🟢 **[DRAFTED]** …`, `> 🟠 **[EXPANSION
+///   NOTE]** …`, `> 📝 **[WORKING NOTE]** …`, `> 🖼️ **[FIGURE NOTE]** …`,
+///   `> 📋 **[SOURCE NOTE]** …`, and any future `> <emoji> **[LABEL]**`
+///   marker). The whole blockquote goes, continuation lines included.
+///   Ordinary blockquotes (first character in Latin-1) are kept.
+/// * HTML comments `<!-- … -->`, including multi-line ones.
+/// * legacy bare `[DRAFTED…]` / `[EXPANSION NOTE…]` lines.
+///
+/// Marker notes `[TABLE OF CONTENTS]` / `[TABLE OF FIGURES]` /
+/// `[LIST OF TABLES]` are stripped like any other note but reported through
+/// the returned flags so a converter can act on them (e.g. pass `--toc` to
+/// pandoc). Runs of three or more newlines left behind by the removals are
+/// collapsed to a blank line.
+pub fn strip_source_notes(markdown: &str) -> StrippedSource {
+    let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+    let no_comments = strip_html_comments(markdown);
+
+    let mut out_lines: Vec<&str> = Vec::new();
+    let mut in_note = false;
+    let mut wants_toc = false;
+    let mut wants_figures_list = false;
+    let mut wants_tables_list = false;
+
+    for line in no_comments.lines() {
+        let stripped = line.trim();
+        if in_note {
+            if stripped.starts_with('>') {
+                continue; // still inside the note blockquote
+            }
+            in_note = false;
+        }
+        if is_note_open(stripped) {
+            in_note = true;
+            if stripped.contains("[TABLE OF CONTENTS]") {
+                wants_toc = true;
+            } else if stripped.contains("[TABLE OF FIGURES]") {
+                wants_figures_list = true;
+            } else if stripped.contains("[LIST OF TABLES]") {
+                wants_tables_list = true;
+            }
+            continue;
+        }
+        if stripped.starts_with("[DRAFTED") || stripped.starts_with("[EXPANSION NOTE") {
+            continue;
+        }
+        out_lines.push(line);
+    }
+
+    let mut text = out_lines.join("\n");
+    while text.contains("\n\n\n") {
+        text = text.replace("\n\n\n", "\n\n");
+    }
+    StrippedSource { text, wants_toc, wants_figures_list, wants_tables_list }
+}
+
+/// True if a trimmed line opens a source-note blockquote: `>` followed
+/// (after optional spaces) by a character outside Latin-1 — in practice an
+/// emoji marker like 🟢/🟠/📝/🖼️/📋/🧭.
+fn is_note_open(stripped: &str) -> bool {
+    stripped
+        .strip_prefix('>')
+        .map(|rest| {
+            matches!(rest.trim_start().chars().next(), Some(c) if c as u32 > 0xff)
+        })
+        .unwrap_or(false)
+}
+
+/// Remove `<!-- … -->` comments (multi-line included); a newline directly
+/// after a comment goes with it so no stray blank line is left behind.
+fn strip_html_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end_rel) => {
+                let mut after = &rest[start + end_rel + 3..];
+                if let Some(a) = after.strip_prefix("\r\n") {
+                    after = a;
+                } else if let Some(a) = after.strip_prefix('\n') {
+                    after = a;
+                }
+                rest = after;
+            }
+            None => {
+                // Unterminated comment: drop to end of input.
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Count word-bounded `TBC` placeholders (the convention's only allowed
+/// placeholder: it may remain in an interim deliverable, never in a final
+/// one). Word-bounded so identifiers like `TBCX` do not count.
+pub fn count_tbc(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(idx) = text[from..].find("TBC") {
+        let at = from + idx;
+        let before_ok = at == 0
+            || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+        let after = at + 3;
+        let after_ok = after >= bytes.len()
+            || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+        if before_ok && after_ok {
+            count += 1;
+        }
+        from = at + 3;
+    }
+    count
+}
+
 /// Strip markdown down to readable plain text.
 pub fn markdown_to_plain_text(markdown: &str) -> String {
     let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
@@ -852,6 +983,74 @@ mod tests {
         assert!(has_uri_scheme("data:image/png;base64,AA"));
         assert!(!has_uri_scheme("C:\\images\\x.png")); // Windows drive, not a scheme
         assert!(!has_uri_scheme("figures/x.png"));
+    }
+
+    #[test]
+    fn test_strip_notes_removes_emoji_blockquote_with_continuation() {
+        let md = "# Title\n\n> 🟢 **[DRAFTED]** section done\n> more of the note\n\nReal prose.\n";
+        let s = strip_source_notes(md);
+        assert!(!s.text.contains("DRAFTED"), "got: {}", s.text);
+        assert!(!s.text.contains("more of the note"));
+        assert!(s.text.contains("# Title"));
+        assert!(s.text.contains("Real prose."));
+    }
+
+    #[test]
+    fn test_strip_notes_keeps_ordinary_blockquotes() {
+        let md = "> A normal quotation someone wrote.\n\ntext\n";
+        let s = strip_source_notes(md);
+        assert!(s.text.contains("A normal quotation"), "got: {}", s.text);
+    }
+
+    #[test]
+    fn test_strip_notes_all_marker_kinds() {
+        let md = "> 🟠 **[EXPANSION NOTE]** add later\n\n> 📝 **[WORKING NOTE]** hmm\n\n> 🖼️ **[FIGURE NOTE]** rebuild via script\n\n> 📋 **[SOURCE NOTE]** build info\n\nkept\n";
+        let s = strip_source_notes(md);
+        for gone in ["EXPANSION", "WORKING", "FIGURE", "SOURCE NOTE"] {
+            assert!(!s.text.contains(gone), "{gone} survived: {}", s.text);
+        }
+        assert!(s.text.contains("kept"));
+    }
+
+    #[test]
+    fn test_strip_notes_removes_html_comments_multiline() {
+        let md = "before\n<!-- one line -->\nmiddle\n<!-- spans\nlines -->\nafter\n";
+        let s = strip_source_notes(md);
+        assert!(!s.text.contains("one line"));
+        assert!(!s.text.contains("spans"));
+        assert!(s.text.contains("before") && s.text.contains("middle") && s.text.contains("after"));
+    }
+
+    #[test]
+    fn test_strip_notes_removes_legacy_bracket_lines() {
+        let md = "text\n[DRAFTED]\n[DRAFTED - intro]\n[EXPANSION NOTE: todo]\nmore\n";
+        let s = strip_source_notes(md);
+        assert!(!s.text.contains("DRAFTED") && !s.text.contains("EXPANSION"));
+        assert!(s.text.contains("text") && s.text.contains("more"));
+    }
+
+    #[test]
+    fn test_strip_notes_reports_toc_and_list_markers() {
+        let md = "> 🧭 **[TABLE OF CONTENTS]** auto\n\n> 🗂️ **[TABLE OF FIGURES]** auto\n\n> 📑 **[LIST OF TABLES]** auto\n\nbody\n";
+        let s = strip_source_notes(md);
+        assert!(s.wants_toc && s.wants_figures_list && s.wants_tables_list);
+        assert!(!s.text.contains("TABLE OF"));
+        assert!(s.text.contains("body"));
+    }
+
+    #[test]
+    fn test_strip_notes_collapses_blank_runs() {
+        let md = "a\n\n> 📝 **[WORKING NOTE]** x\n\n\nb\n";
+        let s = strip_source_notes(md);
+        assert!(!s.text.contains("\n\n\n"), "got: {:?}", s.text);
+    }
+
+    #[test]
+    fn test_count_tbc_word_bounded() {
+        assert_eq!(count_tbc("TBC"), 1);
+        assert_eq!(count_tbc("x TBC y TBC (details)"), 2);
+        assert_eq!(count_tbc("TBCX and XTBC and TBC_"), 0);
+        assert_eq!(count_tbc("clean"), 0);
     }
 
     #[test]

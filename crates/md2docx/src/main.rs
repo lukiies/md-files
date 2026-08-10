@@ -12,6 +12,13 @@ use std::process::{Command, ExitCode};
 const USAGE: &str = "\
 md2docx - convert Markdown to a Word document (via pandoc)
 
+The .md file is treated as the editable SOURCE and the .docx as the compiled
+deliverable: visible working notes (any blockquote opening with an emoji
+marker, e.g. \"> \u{1f7e2} **[DRAFTED]** ...\"), HTML comments and legacy
+[DRAFTED]/[EXPANSION NOTE] lines are stripped before conversion, so they
+never reach the document. A \"> \u{1f9ed} **[TABLE OF CONTENTS]**\" marker
+note turns into a pandoc table of contents at conversion time.
+
 Usage:
   md2docx [OPTIONS] FILE
 
@@ -23,12 +30,17 @@ Options:
   --reference-doc FILE  Style the output like this reference .docx (pandoc
                         --reference-doc: fonts, heading styles, margins)
   --toc                 Insert a table of contents
+  --keep-notes          Convert the source verbatim - do not strip notes,
+                        HTML comments or placeholders markers
+  --final               Deliverable must be clean: refuse to convert while
+                        any TBC placeholder remains in the source
   --pandoc PATH         Use this pandoc executable
   -h, --help            Show this help
 
 Examples:
   md2docx report.md
   md2docx report.md -o \"Final Report.docx\" --reference-doc styles.docx
+  md2docx \"report (editable source).md\" -o \"report (final).docx\" --final
 ";
 
 fn main() -> ExitCode {
@@ -36,6 +48,8 @@ fn main() -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut reference_doc: Option<PathBuf> = None;
     let mut toc = false;
+    let mut keep_notes = false;
+    let mut final_stage = false;
     let mut pandoc_override: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
@@ -54,6 +68,8 @@ fn main() -> ExitCode {
                 None => return fail("missing value for --reference-doc"),
             },
             "--toc" => toc = true,
+            "--keep-notes" => keep_notes = true,
+            "--final" => final_stage = true,
             "--pandoc" => match args.next() {
                 Some(v) => pandoc_override = Some(PathBuf::from(v)),
                 None => return fail("missing value for --pandoc"),
@@ -96,8 +112,52 @@ fn main() -> ExitCode {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    // Source -> deliverable: strip working notes unless asked not to. The
+    // cleaned text goes through a temp file; --resource-path keeps relative
+    // images resolving against the real input's folder.
+    let mut temp_input: Option<PathBuf> = None;
+    let pandoc_input = if keep_notes {
+        if final_stage {
+            let text = match std::fs::read_to_string(&input) {
+                Ok(t) => t,
+                Err(e) => return fail(&format!("cannot read {}: {e}", input.display())),
+            };
+            if let Some(code) = refuse_final(&text) {
+                return code;
+            }
+        }
+        input.clone()
+    } else {
+        let text = match std::fs::read_to_string(&input) {
+            Ok(t) => t,
+            Err(e) => return fail(&format!("cannot read {}: {e}", input.display())),
+        };
+        let stripped = md_core::strip_source_notes(&text);
+        if final_stage {
+            if let Some(code) = refuse_final(&stripped.text) {
+                return code;
+            }
+        }
+        if stripped.wants_toc {
+            toc = true;
+        }
+        if stripped.wants_figures_list || stripped.wants_tables_list {
+            eprintln!(
+                "md2docx: note - [TABLE OF FIGURES]/[LIST OF TABLES] markers were \
+                 stripped; auto-updatable Word fields need a docx post-processing \
+                 step, which pandoc cannot produce."
+            );
+        }
+        let temp = std::env::temp_dir().join(format!("md2docx-{}.md", std::process::id()));
+        if let Err(e) = std::fs::write(&temp, &stripped.text) {
+            return fail(&format!("cannot write temp file {}: {e}", temp.display()));
+        }
+        temp_input = Some(temp.clone());
+        temp
+    };
+
     let mut cmd = Command::new(&pandoc);
-    cmd.arg(&input)
+    cmd.arg(&pandoc_input)
         .arg("-o")
         .arg(&output)
         .args(["--from", "markdown", "--to", "docx"])
@@ -113,7 +173,12 @@ fn main() -> ExitCode {
         cmd.arg("--reference-doc").arg(reference);
     }
 
-    match cmd.status() {
+    let result = cmd.status();
+    if let Some(temp) = &temp_input {
+        let _ = std::fs::remove_file(temp);
+    }
+
+    match result {
         Ok(status) if status.success() => {
             println!("wrote {}", output.display());
             ExitCode::SUCCESS
@@ -124,6 +189,20 @@ fn main() -> ExitCode {
         }
         Err(e) => fail(&format!("cannot run pandoc ({}): {e}", pandoc.display())),
     }
+}
+
+/// The --final guard: a deliverable marked final must contain no TBC
+/// placeholders. Returns the failure exit code if any remain.
+fn refuse_final(text: &str) -> Option<ExitCode> {
+    let tbc = md_core::count_tbc(text);
+    if tbc > 0 {
+        eprintln!(
+            "md2docx: REFUSING to convert as final: {tbc} TBC placeholder(s) \
+             remain in the source."
+        );
+        return Some(ExitCode::FAILURE);
+    }
+    None
 }
 
 /// Locate pandoc: PATH first, then the locations the installers use.

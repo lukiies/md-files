@@ -13,8 +13,35 @@ tied to WebView2 and Total Commander.
 | Tool | What it does |
 |------|--------------|
 | `mdread` | GUI markdown reader. Navigate between .md files by clicking links, with native Back/Forward history. Live reload, zoom persistence, dark mode, mermaid diagrams, syntax highlighting, local images of any size and count. |
-| `md2html` | Markdown to HTML. Plain page (CDN assets) or fully self-contained offline file (`--embed`: bundles and images inlined). |
-| `md2docx` | Markdown to Word. Front-end for pandoc with sane defaults (`--reference-doc`, `--toc`, resource path handling). |
+| `md2html` | Markdown to HTML. Plain page (CDN assets) or fully self-contained offline file (`--embed`: bundles and images inlined). `--strip-notes` previews the deliverable (working notes removed). |
+| `md2docx` | Markdown to Word. Front-end for pandoc with sane defaults (`--reference-doc`, `--toc`, resource path handling). Treats the .md as editable source: working notes are stripped from the .docx deliverable (`--keep-notes` to disable, `--final` to enforce a clean build). |
+
+## Source vs deliverable: working notes
+
+The suite treats a markdown file like source code and the converted document
+as the compiled deliverable. Working notes live in the source, clearly
+visible in any viewer, and never reach the converted output:
+
+```markdown
+> 🟢 **[DRAFTED]** this chapter is complete
+> 🟠 **[EXPANSION NOTE]** add the Q3 numbers here later
+> 📝 **[WORKING NOTE]** any other working discussion
+> 🖼️ **[FIGURE NOTE]** figure provenance / rebuild instructions
+> 📋 **[SOURCE NOTE]** build & status key info
+```
+
+Any blockquote whose first line opens with an emoji is a note — the whole
+blockquote (continuation lines included) is stripped by `md2docx` (default)
+and by `md2html --strip-notes`. `mdread` shows notes, as a viewer should.
+HTML comments `<!-- … -->` are stripped too. Leave a blank line after a note
+so the following prose is not absorbed into the blockquote.
+
+Extras that come with the convention:
+
+* `> 🧭 **[TABLE OF CONTENTS]**` — a marker note: stripped, but `md2docx`
+  generates a pandoc table of contents in its place.
+* `TBC` is the only sanctioned placeholder. It passes into interim builds;
+  `md2docx --final` refuses to convert while any `TBC` remains outside notes.
 
 All three share one engine (`md-core`): GitHub Flavored Markdown, footnotes,
 task lists, ` ```mermaid ` diagram blocks, highlight.js code coloring, and
@@ -75,7 +102,9 @@ powershell -ExecutionPolicy Bypass -File install\install-windows.ps1
 ```
 
 Builds, installs to `%LOCALAPPDATA%\Programs\md-files`, adds it to the user
-PATH, and registers mdread in the Open With list for `.md`/`.markdown`.
+PATH, registers mdread in the Open With list for `.md`/`.markdown`, and adds
+Explorer right-click entries: Open in mdread, Convert to HTML (writes the
+.html next to the file), Convert to Word (writes the .docx next to the file).
 Uninstall with `-Uninstall`.
 
 `md2docx` needs pandoc: `winget install --id JohnMacFarlane.Pandoc` (an

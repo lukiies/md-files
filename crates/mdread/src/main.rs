@@ -28,6 +28,8 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::WindowBuilder;
 use wry::http::{header::CONTENT_TYPE, Request, Response};
 use wry::WebViewBuilder;
+#[cfg(windows)]
+use wry::WebViewBuilderExtWindows;
 
 use md_core::{percent_decode, percent_encode};
 
@@ -119,6 +121,19 @@ fn main() {
         matches!(dark_light::detect(), Ok(dark_light::Mode::Dark))
     });
 
+    // MDREAD_SMOKE=1: exit 0 as soon as the first page reports DOMContentLoaded
+    // through IPC (proof the protocol handler served it and the WebView
+    // rendered), or 3 on timeout. Lets tests and scripts verify the full
+    // window → protocol → render pipeline headlessly-ish (a window flashes).
+    let smoke_test = std::env::var_os("MDREAD_SMOKE").is_some();
+    if smoke_test {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(20));
+            eprintln!("mdread: smoke test timed out waiting for page load");
+            std::process::exit(3);
+        });
+    }
+
     // Resolve the file to open: CLI argument or file dialog.
     let initial = match file_arg {
         Some(p) => match std::fs::canonicalize(&p) {
@@ -155,6 +170,8 @@ fn main() {
     let handler_doc = current_doc.clone();
     let handler_proxy = proxy.clone();
     let protocol = move |_id: wry::WebViewId, request: Request<Vec<u8>>| -> Response<Cow<'static, [u8]>> {
+        #[cfg(debug_assertions)]
+        eprintln!("[mdread] protocol request: {}", request.uri());
         serve(&request, dark_mode, &handler_doc, &handler_proxy)
     };
 
@@ -180,6 +197,9 @@ fn main() {
         }
     };
 
+    #[cfg(debug_assertions)]
+    eprintln!("[mdread] initial={} url={}", initial.display(), page_url(&initial, None));
+
     let init_script = GLUE_JS.replace("__PROTO_BASE__", proto_base());
 
     let builder = WebViewBuilder::new()
@@ -187,6 +207,14 @@ fn main() {
         .with_custom_protocol("mdfiles".to_string(), protocol)
         .with_initialization_script(&init_script)
         .with_ipc_handler(ipc);
+
+    // On Windows, wry maps custom protocols to `<http|https>://mdfiles.localhost`
+    // and intercepts only that prefix — and it defaults to http. Every URL this
+    // viewer builds uses https (see proto_base), so the two MUST stay in sync:
+    // without this call the interception filter never matches and every page
+    // fails with ERR_CONNECTION_REFUSED.
+    #[cfg(windows)]
+    let builder = builder.with_https_scheme(true);
 
     #[cfg(any(windows, target_os = "macos"))]
     let webview = builder.build(&window).expect("failed to create webview");
@@ -234,6 +262,10 @@ fn main() {
             }
             Event::UserEvent(user) => match user {
                 UserEvent::PageLoaded => {
+                    if smoke_test {
+                        eprintln!("mdread: smoke test OK (page loaded)");
+                        std::process::exit(0);
+                    }
                     if (zoom - 1.0).abs() > f64::EPSILON {
                         let _ = webview.zoom(zoom);
                     }
@@ -336,30 +368,36 @@ fn serve(
     }
 
     if let Some(rest) = path.strip_prefix("/root/") {
-        // First segment: the percent-encoded absolute serve root. The rest:
-        // the file's path segments below it.
-        let mut segments = rest.split('/');
-        let Some(root_enc) = segments.next() else {
-            return not_found("missing serve root");
-        };
-        let root = PathBuf::from(percent_decode(root_enc));
-        let mut file = root;
-        for seg in segments {
-            let decoded = percent_decode(seg);
-            // Reject traversal segments — the root already encodes the full
-            // allowed prefix.
-            if decoded == ".." || decoded.contains('\\') || decoded.contains('/') {
-                return not_found("bad path segment");
-            }
-            file.push(decoded);
-        }
-        return match std::fs::read(&file) {
-            Ok(bytes) => respond(bytes, md_core::mime_for(&file)),
-            Err(_) => not_found("file not found"),
+        return match resolve_root_file(rest) {
+            Some(file) => match std::fs::read(&file) {
+                Ok(bytes) => respond(bytes, md_core::mime_for(&file)),
+                Err(_) => not_found("file not found"),
+            },
+            None => not_found("bad path segment"),
         };
     }
 
     not_found("unknown route")
+}
+
+/// Resolve a `/root/<encoded abs root>/<rel segments…>` URL path (with the
+/// `/root/` prefix already stripped) to the on-disk file it addresses. The
+/// first segment is the percent-encoded absolute serve root; the remaining
+/// segments are the file's path below it. Returns `None` for traversal or
+/// separator-carrying segments — the root already encodes the full allowed
+/// prefix.
+fn resolve_root_file(rest: &str) -> Option<PathBuf> {
+    let mut segments = rest.split('/');
+    let root_enc = segments.next()?;
+    let mut file = PathBuf::from(percent_decode(root_enc));
+    for seg in segments {
+        let decoded = percent_decode(seg);
+        if decoded == ".." || decoded.contains('\\') || decoded.contains('/') {
+            return None;
+        }
+        file.push(decoded);
+    }
+    Some(file)
 }
 
 /// Extract and decode the `p=` parameter of a page URL's query string.
@@ -443,6 +481,12 @@ fn config_file() -> Option<PathBuf> {
 fn load_zoom() -> f64 {
     let Some(path) = config_file() else { return 1.0 };
     let Ok(text) = std::fs::read_to_string(path) else { return 1.0 };
+    parse_zoom(&text)
+}
+
+/// Extract the persisted zoom factor from the config file's text; anything
+/// missing, unparsable, or outside the UI's zoom bounds falls back to 1.0.
+fn parse_zoom(text: &str) -> f64 {
     text.lines()
         .find_map(|l| l.strip_prefix("zoom=")?.trim().parse::<f64>().ok())
         .filter(|z| (0.25..=5.0).contains(z))
@@ -505,3 +549,63 @@ const GLUE_JS: &str = r#"
   }, {passive:false});
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_page_url_encodes_path_and_keeps_fragment() {
+        let url = page_url(Path::new("C:\\docs\\my notes.md"), Some("top"));
+        assert!(url.starts_with(proto_base()), "got: {url}");
+        assert!(url.contains("/page?p="), "got: {url}");
+        // Space and backslash are percent-encoded, fragment survives verbatim.
+        assert!(url.contains("%20"), "got: {url}");
+        assert!(!url[url.find("p=").unwrap()..].contains(' '), "got: {url}");
+        assert!(url.ends_with("#top"), "got: {url}");
+    }
+
+    #[test]
+    fn test_query_path_roundtrips_through_page_url() {
+        let original = Path::new("C:\\docs\\my notes.md");
+        let url = page_url(original, None);
+        let query = url.split('?').nth(1).unwrap();
+        assert_eq!(query_path(query), Some(original.to_path_buf()));
+    }
+
+    #[test]
+    fn test_query_path_picks_p_among_other_params() {
+        assert_eq!(query_path("a=1&p=x.md&b=2"), Some(PathBuf::from("x.md")));
+        assert_eq!(query_path("a=1&b=2"), None);
+        assert_eq!(query_path(""), None);
+    }
+
+    #[test]
+    fn test_resolve_root_file_joins_segments() {
+        let root_enc = percent_encode("C:\\serve root");
+        let resolved = resolve_root_file(&format!("{root_enc}/figures/fig%201.png")).unwrap();
+        assert_eq!(
+            resolved,
+            Path::new("C:\\serve root").join("figures").join("fig 1.png")
+        );
+    }
+
+    #[test]
+    fn test_resolve_root_file_rejects_traversal() {
+        let root_enc = percent_encode("C:\\serve");
+        // Literal, encoded, and separator-smuggling traversal all rejected.
+        assert!(resolve_root_file(&format!("{root_enc}/../secret.txt")).is_none());
+        assert!(resolve_root_file(&format!("{root_enc}/%2E%2E/secret.txt")).is_none());
+        assert!(resolve_root_file(&format!("{root_enc}/a%5Cb.txt")).is_none()); // encoded '\'
+        assert!(resolve_root_file(&format!("{root_enc}/a%2Fb.txt")).is_none()); // encoded '/'
+    }
+
+    #[test]
+    fn test_parse_zoom_bounds() {
+        assert_eq!(parse_zoom("zoom=1.500\n"), 1.5);
+        assert_eq!(parse_zoom("zoom=99"), 1.0); // out of range -> default
+        assert_eq!(parse_zoom("zoom=0.1"), 1.0); // below minimum -> default
+        assert_eq!(parse_zoom("garbage"), 1.0);
+        assert_eq!(parse_zoom(""), 1.0);
+    }
+}

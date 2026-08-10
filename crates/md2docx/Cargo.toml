@@ -9,3 +9,6 @@ authors.workspace = true
 [[bin]]
 name = "md2docx"
 path = "src/main.rs"
+
+[dependencies]
+md-core = { workspace = true }

@@ -20,11 +20,16 @@ Arguments:
 
 Options:
   -o, --out FILE   Write output to FILE instead of stdout
+  --save           Write output next to the input file (input name with
+                   .html extension); requires a FILE input
   --body           Output the HTML body fragment only (no <html> wrapper)
   --embed          Self-contained page: inline mermaid/highlight bundles so the
                    file renders fully offline (default uses public CDNs)
   --dark           Dark color scheme (default: light)
   --title TEXT     Page <title> (default: the input filename)
+  --strip-notes    Remove source-only working notes before converting
+                   (emoji-blockquote notes like \"> \u{1f7e2} **[DRAFTED]** ...\",
+                   HTML comments) - preview the document as a deliverable
   -h, --help       Show this help
 
 Examples:
@@ -39,6 +44,8 @@ fn main() -> ExitCode {
     let mut body_only = false;
     let mut embed = false;
     let mut dark = false;
+    let mut strip_notes = false;
+    let mut save_next_to_input = false;
     let mut title: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
@@ -55,6 +62,8 @@ fn main() -> ExitCode {
             "--body" => body_only = true,
             "--embed" => embed = true,
             "--dark" => dark = true,
+            "--strip-notes" => strip_notes = true,
+            "--save" => save_next_to_input = true,
             "--title" => match args.next() {
                 Some(v) => title = Some(v),
                 None => return fail("missing value for --title"),
@@ -68,6 +77,15 @@ fn main() -> ExitCode {
                 }
                 input = Some(PathBuf::from(arg));
             }
+        }
+    }
+
+    // --save: derive the output path from the input file (context-menu use).
+    if save_next_to_input {
+        match (&input, &output) {
+            (None, _) => return fail("--save needs a FILE input (not stdin)"),
+            (Some(path), None) => output = Some(path.with_extension("html")),
+            (Some(_), Some(_)) => {} // explicit -o wins
         }
     }
 
@@ -91,6 +109,14 @@ fn main() -> ExitCode {
             }
             (text, None, "Markdown".to_string())
         }
+    };
+
+    // --strip-notes: preview the deliverable — drop the source-only working
+    // notes exactly the way md2docx does before compiling.
+    let markdown = if strip_notes {
+        md_core::strip_source_notes(&markdown).text
+    } else {
+        markdown
     };
 
     // Image paths are left as authored (they resolve relative to the output's

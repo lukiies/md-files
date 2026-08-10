@@ -5,6 +5,51 @@ All notable changes to md-files are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-08-10
+
+The source/deliverable release: the `.md` file is the editable source, the
+converted output is the compiled deliverable, and working notes never cross
+that line.
+
+### Added
+- **md-core** — `strip_source_notes`: removes source-only annotations —
+  emoji-blockquote notes (`> 🟢 **[DRAFTED]** …`, `> 🟠 **[EXPANSION
+  NOTE]** …`, `> 📝 **[WORKING NOTE]** …`, `> 🖼️ **[FIGURE NOTE]** …`,
+  `> 📋 **[SOURCE NOTE]** …`, continuation lines included), HTML comments
+  (multi-line too), and legacy bare `[DRAFTED…]`/`[EXPANSION NOTE…]` lines.
+  `[TABLE OF CONTENTS]`/`[TABLE OF FIGURES]`/`[LIST OF TABLES]` marker notes
+  are stripped but reported to the caller. `count_tbc` counts word-bounded
+  `TBC` placeholders (the convention's only sanctioned placeholder).
+- **md2docx** — strips working notes before conversion by default;
+  `--keep-notes` converts the source verbatim; `--final` refuses to convert
+  while any `TBC` placeholder remains; a `> 🧭 **[TABLE OF CONTENTS]**`
+  marker note turns into a pandoc table of contents.
+- **md2html** — `--strip-notes` previews the deliverable (same stripping as
+  md2docx); `--save` writes the `.html` next to the input file (built for the
+  Explorer context menu).
+- **mdread** — `MDREAD_SMOKE=1` smoke mode: exits 0 once the first page
+  reports DOMContentLoaded through IPC (proves the protocol handler served
+  the page and the WebView rendered it), 3 on timeout.
+- **install-windows.ps1** — Explorer right-click entries for `.md`/
+  `.markdown`: Open in mdread, Convert to HTML, Convert to Word; mdread now
+  also claims the per-user extension default progid and gets a file icon.
+- Integration test suites for all three binaries (`md2html` end-to-end CLI
+  tests, `md2docx` CLI tests with pandoc-dependent cases skipped when pandoc
+  is absent, `mdread` Windows render smoke test) and unit tests for mdread's
+  URL/zoom helpers.
+- `demo/` folder with manual-test documents.
+
+### Fixed
+- **mdread** on Windows: wry maps custom protocols to
+  `https://mdfiles.localhost` only when the https scheme is explicitly
+  enabled; without it every page failed with `ERR_CONNECTION_REFUSED`.
+  The smoke test now guards this pipeline.
+
+### Changed
+- **md2docx** treats the `.md` as editable source: working notes are now
+  stripped from the `.docx` by default (previous verbatim behavior is behind
+  `--keep-notes`).
+
 ## [0.1.0] - 2026-08-05
 
 Initial release: the MDView fork's renderer generalized into a cross-platform
