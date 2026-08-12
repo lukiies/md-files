@@ -5,6 +5,15 @@ All notable changes to md-files are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-08-12
+
+### Fixed
+- **md2docx** — user input is validated before pandoc is looked for:
+  `--reference-doc` existence and the `--final` TBC guard now report their
+  own errors on machines without pandoc instead of being masked by the
+  "pandoc not found" install instructions. The stripped-notes temp file is
+  also cleaned up when pandoc turns out to be missing.
+
 ## [0.3.0] - 2026-08-12
 
 The reader remembers its window.

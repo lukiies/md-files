@@ -93,17 +93,14 @@ fn main() -> ExitCode {
 
     let output = output.unwrap_or_else(|| input.with_extension("docx"));
 
-    let Some(pandoc) = pandoc_override.or_else(find_pandoc) else {
-        eprintln!("md2docx: pandoc not found.");
-        eprintln!();
-        eprintln!("Install it and retry:");
-        eprintln!("  Windows: winget install --id JohnMacFarlane.Pandoc");
-        eprintln!("  macOS:   brew install pandoc");
-        eprintln!("  Linux:   sudo apt install pandoc   (or your distro's package)");
-        eprintln!();
-        eprintln!("Or point at an existing install with --pandoc <path>.");
-        return ExitCode::FAILURE;
-    };
+    // All user input is validated before pandoc is even looked for, so a
+    // machine without pandoc still reports what is actually wrong with the
+    // invocation instead of masking it behind the install instructions.
+    if let Some(reference) = &reference_doc {
+        if !reference.is_file() {
+            return fail(&format!("reference doc not found: {}", reference.display()));
+        }
+    }
 
     // Relative images in the document resolve against the input's folder.
     let resource_dir = input
@@ -156,6 +153,21 @@ fn main() -> ExitCode {
         temp
     };
 
+    let Some(pandoc) = pandoc_override.or_else(find_pandoc) else {
+        if let Some(temp) = &temp_input {
+            let _ = std::fs::remove_file(temp);
+        }
+        eprintln!("md2docx: pandoc not found.");
+        eprintln!();
+        eprintln!("Install it and retry:");
+        eprintln!("  Windows: winget install --id JohnMacFarlane.Pandoc");
+        eprintln!("  macOS:   brew install pandoc");
+        eprintln!("  Linux:   sudo apt install pandoc   (or your distro's package)");
+        eprintln!();
+        eprintln!("Or point at an existing install with --pandoc <path>.");
+        return ExitCode::FAILURE;
+    };
+
     let mut cmd = Command::new(&pandoc);
     cmd.arg(&pandoc_input)
         .arg("-o")
@@ -167,9 +179,6 @@ fn main() -> ExitCode {
         cmd.arg("--toc");
     }
     if let Some(reference) = &reference_doc {
-        if !reference.is_file() {
-            return fail(&format!("reference doc not found: {}", reference.display()));
-        }
         cmd.arg("--reference-doc").arg(reference);
     }
 
