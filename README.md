@@ -12,7 +12,7 @@ tied to WebView2 and Total Commander.
 
 | Tool | What it does |
 |------|--------------|
-| `mdread` | GUI markdown reader. Navigate between .md files by clicking links, with native Back/Forward history. Live reload, zoom persistence, dark mode, mermaid diagrams, syntax highlighting, local images of any size and count. |
+| `mdread` | GUI markdown reader. Navigate between .md files by clicking links, with native Back/Forward history. Live reload, remembered window layout and zoom, dark mode, mermaid diagrams, syntax highlighting, local images of any size and count. |
 | `md2html` | Markdown to HTML. Plain page (CDN assets) or fully self-contained offline file (`--embed`: bundles and images inlined). `--strip-notes` previews the deliverable (working notes removed). |
 | `md2docx` | Markdown to Word. Front-end for pandoc with sane defaults (`--reference-doc`, `--toc`, resource path handling). Treats the .md as editable source: working notes are stripped from the .docx deliverable (`--keep-notes` to disable, `--final` to enforce a clean build). |
 
@@ -75,6 +75,9 @@ access needed.
 | Ctrl+scroll, Ctrl+`+`/`-` | Zoom (persisted across sessions) |
 | Ctrl+0 | Reset zoom |
 | Mouse Back/Forward | History across linked .md files |
+
+Window position, size, and maximized state are remembered on close and
+restored on the next start, alongside the zoom level.
 
 ## Usage
 

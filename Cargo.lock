@@ -1561,28 +1561,28 @@ dependencies = [
 
 [[package]]
 name = "md-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pulldown-cmark",
 ]
 
 [[package]]
 name = "md2docx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "md-core",
 ]
 
 [[package]]
 name = "md2html"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "md-core",
 ]
 
 [[package]]
 name = "mdread"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dark-light",
  "dirs",

@@ -5,6 +5,20 @@ All notable changes to md-files are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-08-12
+
+The reader remembers its window.
+
+### Added
+- **mdread** — window layout persistence: position, size, and maximized state
+  are saved to the config file (`md-files/mdread.conf` under the user config
+  directory, next to the zoom level) when the window closes and on every zoom
+  change, then restored on the next start. Geometry is tracked only while the
+  window is not maximized, so maximizing never overwrites the normal layout.
+  Implausible values — Windows' minimized parking position, sub-200 px sizes,
+  corrupted config lines — are rejected and fall back to the 1000×800 default,
+  so a damaged config can never open the window broken or off-screen.
+
 ## [0.2.0] - 2026-08-10
 
 The source/deliverable release: the `.md` file is the editable source, the

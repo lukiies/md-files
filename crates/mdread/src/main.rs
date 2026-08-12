@@ -22,10 +22,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use tao::dpi::LogicalSize;
+use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tao::window::WindowBuilder;
+use tao::window::{Window, WindowBuilder};
 use wry::http::{header::CONTENT_TYPE, Request, Response};
 use wry::WebViewBuilder;
 #[cfg(windows)]
@@ -96,6 +96,8 @@ Keys:
   Ctrl+scroll / +/-   zoom (persisted)
   Ctrl+0              reset zoom
   Mouse Back/Forward  navigate history across linked .md files
+
+Window position, size, maximized state, and zoom persist across sessions.
 ";
 
 fn main() {
@@ -152,13 +154,23 @@ fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
+    let config = load_config();
+
     let title = format!(
         "{} - mdread",
         initial.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     );
-    let window = WindowBuilder::new()
-        .with_title(&title)
-        .with_inner_size(LogicalSize::new(1000.0, 800.0))
+    let mut window_builder = WindowBuilder::new().with_title(&title);
+    window_builder = match config.window {
+        Some((x, y, w, h)) => window_builder
+            .with_position(PhysicalPosition::new(x, y))
+            .with_inner_size(PhysicalSize::new(w, h)),
+        None => window_builder.with_inner_size(LogicalSize::new(1000.0, 800.0)),
+    };
+    if config.maximized {
+        window_builder = window_builder.with_maximized(true);
+    }
+    let window = window_builder
         .build(&event_loop)
         .expect("failed to create window");
 
@@ -252,14 +264,37 @@ fn main() {
         });
     }
 
-    let mut zoom = load_zoom();
+    let mut zoom = config.zoom;
+    // Last known un-maximized window geometry, updated as the user moves or
+    // resizes the window and written back to the config on exit.
+    let mut win_geom = config.window;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                *control_flow = ControlFlow::Exit;
-            }
+            Event::WindowEvent { event, .. } => match event {
+                WindowEvent::CloseRequested => {
+                    persist_state(&window, zoom, win_geom);
+                    *control_flow = ControlFlow::Exit;
+                }
+                WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                    // Track normal geometry only: while maximized the saved
+                    // values must stay at the pre-maximize state, and a
+                    // minimized window reports the (-32000, -32000) parking
+                    // position, which sane_geometry rejects.
+                    if !window.is_maximized() {
+                        if let Ok(pos) = window.outer_position() {
+                            let size = window.inner_size();
+                            if let Some(geom) =
+                                sane_geometry(pos.x, pos.y, size.width, size.height)
+                            {
+                                win_geom = Some(geom);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
             Event::UserEvent(user) => match user {
                 UserEvent::PageLoaded => {
                     if smoke_test {
@@ -289,19 +324,20 @@ fn main() {
                 UserEvent::ZoomIn => {
                     zoom = (zoom * 1.1).min(5.0);
                     let _ = webview.zoom(zoom);
-                    save_zoom(zoom);
+                    persist_state(&window, zoom, win_geom);
                 }
                 UserEvent::ZoomOut => {
                     zoom = (zoom / 1.1).max(0.25);
                     let _ = webview.zoom(zoom);
-                    save_zoom(zoom);
+                    persist_state(&window, zoom, win_geom);
                 }
                 UserEvent::ZoomReset => {
                     zoom = 1.0;
                     let _ = webview.zoom(zoom);
-                    save_zoom(zoom);
+                    persist_state(&window, zoom, win_geom);
                 }
                 UserEvent::Close => {
+                    persist_state(&window, zoom, win_geom);
                     *control_flow = ControlFlow::Exit;
                 }
             },
@@ -472,33 +508,104 @@ fn pick_markdown_file() -> Option<PathBuf> {
         .pick_file()
 }
 
-// ---- persisted zoom ---------------------------------------------------------
+// ---- persisted settings (zoom + window geometry) ----------------------------
+
+/// Un-maximized window geometry in physical pixels: outer position (x, y) and
+/// inner size (w, h).
+type WindowGeom = (i32, i32, u32, u32);
+
+/// Everything mdread remembers between sessions, stored as `key=value` lines
+/// in the config file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Config {
+    zoom: f64,
+    window: Option<WindowGeom>,
+    maximized: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config { zoom: 1.0, window: None, maximized: false }
+    }
+}
 
 fn config_file() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("md-files").join("mdread.conf"))
 }
 
-fn load_zoom() -> f64 {
-    let Some(path) = config_file() else { return 1.0 };
-    let Ok(text) = std::fs::read_to_string(path) else { return 1.0 };
-    parse_zoom(&text)
+fn load_config() -> Config {
+    let Some(path) = config_file() else { return Config::default() };
+    let Ok(text) = std::fs::read_to_string(path) else { return Config::default() };
+    parse_config(&text)
 }
 
-/// Extract the persisted zoom factor from the config file's text; anything
-/// missing, unparsable, or outside the UI's zoom bounds falls back to 1.0.
-fn parse_zoom(text: &str) -> f64 {
-    text.lines()
-        .find_map(|l| l.strip_prefix("zoom=")?.trim().parse::<f64>().ok())
-        .filter(|z| (0.25..=5.0).contains(z))
-        .unwrap_or(1.0)
+/// Parse the config file's text; anything missing, unparsable, or out of
+/// bounds falls back to its default so a damaged file never breaks startup.
+fn parse_config(text: &str) -> Config {
+    let mut cfg = Config::default();
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("zoom=") {
+            if let Some(z) = v.trim().parse::<f64>().ok().filter(|z| (0.25..=5.0).contains(z)) {
+                cfg.zoom = z;
+            }
+        } else if let Some(v) = line.strip_prefix("window=") {
+            let mut nums = v.trim().split(',');
+            if let (Some(Ok(x)), Some(Ok(y)), Some(Ok(w)), Some(Ok(h)), None) = (
+                nums.next().map(str::parse),
+                nums.next().map(str::parse),
+                nums.next().map(str::parse),
+                nums.next().map(str::parse),
+                nums.next(),
+            ) {
+                cfg.window = sane_geometry(x, y, w, h);
+            }
+        } else if let Some(v) = line.strip_prefix("maximized=") {
+            cfg.maximized = v.trim() == "1";
+        }
+    }
+    cfg
 }
 
-fn save_zoom(zoom: f64) {
+/// Accept a geometry only if it can plausibly be a real on-screen window.
+/// Rejects Windows' (-32000, -32000) minimized parking position, zero sizes,
+/// and absurd values from a corrupted config file.
+fn sane_geometry(x: i32, y: i32, w: u32, h: u32) -> Option<WindowGeom> {
+    const POS: std::ops::RangeInclusive<i32> = -16384..=16384;
+    ((POS.contains(&x) && POS.contains(&y)) && (200..=16384).contains(&w) && (200..=16384).contains(&h))
+        .then_some((x, y, w, h))
+}
+
+fn serialize_config(cfg: &Config) -> String {
+    let mut out = format!("zoom={:.3}\n", cfg.zoom);
+    if let Some((x, y, w, h)) = cfg.window {
+        out.push_str(&format!("window={x},{y},{w},{h}\n"));
+    }
+    out.push_str(&format!("maximized={}\n", u8::from(cfg.maximized)));
+    out
+}
+
+fn save_config(cfg: &Config) {
     let Some(path) = config_file() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, format!("zoom={zoom:.3}\n"));
+    let _ = std::fs::write(path, serialize_config(cfg));
+}
+
+/// Write the current zoom and window state to the config file. `geom` is the
+/// last geometry tracked from Moved/Resized events; if none arrived yet the
+/// window is queried directly (unless maximized, where the query would return
+/// the maximized rectangle instead of the state to restore to).
+fn persist_state(window: &Window, zoom: f64, geom: Option<WindowGeom>) {
+    let maximized = window.is_maximized();
+    let mut geom = geom;
+    if geom.is_none() && !maximized {
+        if let Ok(pos) = window.outer_position() {
+            let size = window.inner_size();
+            geom = sane_geometry(pos.x, pos.y, size.width, size.height);
+        }
+    }
+    save_config(&Config { zoom, window: geom, maximized });
 }
 
 // ---- the glue script injected into every page ------------------------------
@@ -601,11 +708,55 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_zoom_bounds() {
-        assert_eq!(parse_zoom("zoom=1.500\n"), 1.5);
-        assert_eq!(parse_zoom("zoom=99"), 1.0); // out of range -> default
-        assert_eq!(parse_zoom("zoom=0.1"), 1.0); // below minimum -> default
-        assert_eq!(parse_zoom("garbage"), 1.0);
-        assert_eq!(parse_zoom(""), 1.0);
+    fn test_parse_config_zoom_bounds() {
+        assert_eq!(parse_config("zoom=1.500\n").zoom, 1.5);
+        assert_eq!(parse_config("zoom=99").zoom, 1.0); // out of range -> default
+        assert_eq!(parse_config("zoom=0.1").zoom, 1.0); // below minimum -> default
+        assert_eq!(parse_config("garbage").zoom, 1.0);
+        assert_eq!(parse_config("").zoom, 1.0);
+    }
+
+    #[test]
+    fn test_parse_config_window_and_maximized() {
+        let cfg = parse_config("zoom=1.200\nwindow=100,-50,1400,900\nmaximized=1\n");
+        assert_eq!(cfg.zoom, 1.2);
+        assert_eq!(cfg.window, Some((100, -50, 1400, 900)));
+        assert!(cfg.maximized);
+
+        // Missing lines leave the defaults in place.
+        let cfg = parse_config("zoom=1.000\n");
+        assert_eq!(cfg.window, None);
+        assert!(!cfg.maximized);
+    }
+
+    #[test]
+    fn test_parse_config_rejects_bad_window_lines() {
+        // Wrong arity, junk values, and out-of-bounds geometry all -> None.
+        assert_eq!(parse_config("window=1,2,3\n").window, None);
+        assert_eq!(parse_config("window=1,2,3,4,5\n").window, None);
+        assert_eq!(parse_config("window=a,b,c,d\n").window, None);
+        assert_eq!(parse_config("window=-32000,-32000,1000,800\n").window, None); // minimized parking pos
+        assert_eq!(parse_config("window=0,0,50,50\n").window, None); // too small
+        assert_eq!(parse_config("window=0,0,99999,800\n").window, None); // absurdly wide
+    }
+
+    #[test]
+    fn test_config_roundtrips_through_serialize() {
+        let cfg = Config { zoom: 1.331, window: Some((-8, 42, 1920, 1042)), maximized: false };
+        assert_eq!(parse_config(&serialize_config(&cfg)), cfg);
+
+        let cfg = Config { zoom: 1.0, window: None, maximized: true };
+        assert_eq!(parse_config(&serialize_config(&cfg)), cfg);
+    }
+
+    #[test]
+    fn test_sane_geometry_bounds() {
+        assert_eq!(sane_geometry(0, 0, 1000, 800), Some((0, 0, 1000, 800)));
+        // Slightly negative positions are real (borderless window edges,
+        // secondary monitors left of the primary).
+        assert!(sane_geometry(-8, -8, 1000, 800).is_some());
+        assert_eq!(sane_geometry(-32000, -32000, 1000, 800), None);
+        assert_eq!(sane_geometry(0, 0, 199, 800), None);
+        assert_eq!(sane_geometry(0, 0, 1000, 20000), None);
     }
 }
