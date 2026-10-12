@@ -1,0 +1,8 @@
+{
+  "tier": "T4",
+  "reservation": "L2",
+  "hours": true,
+  "holidays": false,
+  "standby24": true,
+  "demands": true
+}

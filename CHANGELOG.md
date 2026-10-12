@@ -5,6 +5,61 @@ All notable changes to md-files are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-10-12
+
+ITA-MD 1.0: conditional directives in Markdown sources. One canonical source
+says in which configuration a block, a table row, or a fragment of a
+sentence applies; the suite shows such sources, strips them with a warning,
+or compiles them for one configuration. The standard is described by its
+own handbook and versioned separately from the tools.
+
+### Added
+- **docs/ITA-MD** — *Podręcznik standardu ITA-MD* (Polish handbook, version
+  1.0): the source → deliverable model, conformance levels (author, viewer,
+  compiler), lexical rules and full grammar, every directive with correct and
+  incorrect examples, nesting, GFM tables, expressions, the fact vocabulary
+  file `itamd-slownik.json` and fact sets, compilation semantics with the
+  exact stub wordings, the pass order, fail-closed behaviour, the error
+  catalogue IMD-001…IMD-701, authoring rules, reading sources in mdread,
+  migration from the provisional HTML-comment markers, a worked example from
+  the contract templates, and a glossary. The standard has its own changelog
+  (`docs/ITA-MD/CHANGELOG.md`, ITA-MD MAJOR.MINOR). The handbook's examples
+  are executable tests.
+- **md-core** — `itamd` module: code-aware lexer and checker with the full
+  error catalogue (`check`), the viewer's rendering (`annotate`: framed
+  branches, humanised condition chips, stub badges, row and table chips, a
+  diagnostics panel, a show/hide toolbar; light and dark palettes, no
+  external assets), `strip_directives`, the compiler (`compile`, with
+  `project` and `cleanup` for generators that add their own steps),
+  vocabulary and fact-set loading, and a small strict JSON reader. The
+  compiler output is byte-identical to the contract generator's reference
+  implementation (78 template × profile cases and 52 stored copy parts); an
+  opt-in golden test (`ITAMD_BAU_DIR`) repeats the comparison.
+- **mdread** — sources with directives are shown annotated with a
+  "Warunki: pokaż / ukryj" switch (remembered in the config file) and a
+  "Podgląd dla profilu…" button that compiles the source for a chosen fact
+  set (stubs dimmed; `--itamd-profile FACTS` opens the preview directly).
+  The smoke mode reports how many ITA-MD chips and dimmed stubs the page
+  rendered.
+- **md2html** — sources are rendered annotated by default (the same view as
+  mdread); `--itamd-profile FACTS` compiles.
+- **md2docx** — `--itamd-profile FACTS` compiles before converting.
+
+### Changed
+- **md2docx** and **md2html --strip-notes** strip ITA-MD directives (every
+  branch kept) and warn "plik zawiera dyrektywy ITA-MD 1.0 — to źródło, nie
+  egzemplarz; użyj kompilatora"; `md2docx --final` refuses a source that
+  still holds directives.
+
+### Fixed
+- **md-core** — working notes are recognised by an emoji first character
+  instead of "any character above U+00FF": quotations that open with a
+  Polish letter or a quotation mark (`> „Cytat…”`, `> Łukasz …`) are no
+  longer stripped from deliverables.
+- **md-core** — note, comment, and directive stripping never touches code
+  blocks or code spans, so documents that show notes or directives as
+  examples keep them; blank-line collapsing no longer alters code blocks.
+
 ## [0.3.1] - 2026-08-12
 
 ### Fixed

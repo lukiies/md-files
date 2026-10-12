@@ -251,9 +251,130 @@ fn missing_input_file_fails() {
 
 #[test]
 fn missing_option_values_fail() {
-    for flag in ["--out", "--title"] {
+    for flag in ["--out", "--title", "--itamd-profile"] {
         let out = md2html().arg(flag).output().unwrap();
         assert!(!out.status.success(), "{flag} with no value should fail");
         assert!(stderr_str(&out).contains("missing value"));
     }
+}
+
+// ---- ITA-MD conditional directives -----------------------------------------
+
+/// A small source with a block (numbered, default stub), an inline group,
+/// and a row directive with a stub.
+const ITAMD_SOURCE: &str = "# Cennik\n\n\
+> \u{1f500} \u{27e6}JEŻELI tier >= T4\u{27e7}\n\n\
+6. **Rekompensata SLA.** Według Załącznika D.\n\
+> \u{1f500} \u{27e6}KONIEC\u{27e7}\n\n\n\
+Zakres określa \u{27e6}JEŻELI tier >= T4\u{27e7}Załącznik D\u{27e6}W PRZECIWNYM RAZIE\u{27e7}Załącznik A\u{27e6}KONIEC\u{27e7}.\n\n\
+| Poz. | Świadczenie | Opłata |\n|---|---|---|\n\
+| \u{27e6}WIERSZ standby24 · zaślepka: numer\u{27e7}**E5.2** | Dyżur 24h | +20% |\n";
+
+const WARNING: &str = "plik zawiera dyrektywy ITA-MD 1.0 — to źródło, nie egzemplarz; użyj kompilatora";
+
+#[test]
+fn itamd_source_is_shown_annotated_by_default() {
+    let dir = Scratch::new("itamd_annotated");
+    let md = dir.write("cennik.md", ITAMD_SOURCE.as_bytes());
+    let out = md2html().arg(&md).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_str(&out));
+    let html = stdout_str(&out);
+    // Toolbar, frames, chips, the show/hide script and styles.
+    for needle in ["id=\"imd-pasek\"", "class=\"imd-blok\"", "imd-k-jezeli", "imd-k-wiersz", "itamd-ukryj", ".imd-gal"] {
+        assert!(html.contains(needle), "missing {needle}: {html}");
+    }
+    // Every branch stays visible, the raw directive lines are gone.
+    assert!(html.contains("Załącznik D") && html.contains("Załącznik A"));
+    assert!(html.contains("Rekompensata SLA"));
+    assert!(!html.contains("<blockquote>"), "directive lines must not render as quotes: {html}");
+    // A viewer never warns: the source is shown as a source.
+    assert!(!stderr_str(&out).contains("dyrektywy ITA-MD"));
+}
+
+#[test]
+fn itamd_strip_notes_keeps_every_branch_and_warns() {
+    let dir = Scratch::new("itamd_strip");
+    let md = dir.write("cennik.md", ITAMD_SOURCE.as_bytes());
+    let out = md2html().arg("--body").arg("--strip-notes").arg(&md).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_str(&out));
+    assert!(stderr_str(&out).contains(WARNING), "stderr: {}", stderr_str(&out));
+    let html = stdout_str(&out);
+    assert!(!html.contains('\u{27e6}') && !html.contains('\u{1f500}'), "directive left: {html}");
+    assert!(html.contains("Załącznik DZałącznik A"), "both inline branches kept: {html}");
+    assert!(html.contains("Rekompensata SLA") && html.contains("Dyżur 24h"));
+}
+
+#[test]
+fn itamd_profile_compiles_and_dims_stubs() {
+    let dir = Scratch::new("itamd_profile");
+    let md = dir.write("cennik.md", ITAMD_SOURCE.as_bytes());
+    let facts = dir.write("t2.json", br#"{"tier": "T2", "standby24": false}"#);
+    let out = md2html().arg("--body").arg("--itamd-profile").arg(&facts).arg(&md).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_str(&out));
+    assert!(!stderr_str(&out).contains("dyrektywy ITA-MD"), "a compiled text is not a source");
+    let html = stdout_str(&out);
+    assert!(html.contains("Zakres określa Załącznik A."), "{html}");
+    assert!(!html.contains("Załącznik D"), "{html}");
+    assert!(!html.contains("Rekompensata SLA"), "{html}");
+    assert!(html.contains("<span class=\"imd-nd\">Nie dotyczy niniejszej Umowy.</span>"), "{html}");
+    assert!(html.contains("<span class=\"imd-nd\">nie dotyczy niniejszej Umowy</span>"), "{html}");
+}
+
+#[test]
+fn itamd_profile_fails_closed() {
+    let dir = Scratch::new("itamd_fail");
+    let md = dir.write("cennik.md", ITAMD_SOURCE.as_bytes());
+    let facts = dir.write("bez-tier.json", br#"{"standby24": true}"#);
+    let target = dir.path().join("out.html");
+    let out = md2html().arg("--itamd-profile").arg(&facts).arg(&md).arg("-o").arg(&target).output().unwrap();
+    assert!(!out.status.success());
+    let err = stderr_str(&out);
+    assert!(err.contains("IMD-503"), "stderr: {err}");
+    assert!(!target.exists(), "nothing may be written when compilation fails");
+
+    let missing = md2html().arg("--itamd-profile").arg(dir.path().join("nope.json")).arg(&md).output().unwrap();
+    assert!(!missing.status.success());
+    assert!(stderr_str(&missing).contains("IMD-506"));
+}
+
+#[test]
+fn itamd_vocabulary_is_found_from_the_input_folder() {
+    let dir = Scratch::new("itamd_vocab");
+    std::fs::create_dir_all(dir.path().join("szablony")).unwrap();
+    dir.write(
+        "itamd-slownik.json",
+        r#"{"standard": "ITA-MD 1.0", "nazwa": "test", "fakty": {
+            "tier": {"typ": "poziom", "etykieta": "Poziom"},
+            "standby24": {"typ": "logiczny", "etykieta": "dyżur 24h"}}}"#
+            .as_bytes(),
+    );
+    let md = dir.write("szablony/cennik.md", ITAMD_SOURCE.as_bytes());
+    let out = md2html().arg("--body").arg(&md).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_str(&out));
+    let html = stdout_str(&out);
+    assert!(html.contains("<b>JEŻELI</b> Poziom ≥ T4"), "{html}");
+    assert!(html.contains("<b>WIERSZ</b> dyżur 24h"), "{html}");
+    assert!(html.contains("słownik: test"), "{html}");
+}
+
+#[test]
+fn itamd_errors_are_listed_on_the_page() {
+    let dir = Scratch::new("itamd_errors");
+    let md = dir.write("zly.md", "> \u{1f500} \u{27e6}JEŻELI ef\u{27e7}\n\n6. Treść bez końca bloku.\n".as_bytes());
+    let out = md2html().arg("--body").arg(&md).output().unwrap();
+    assert!(out.status.success());
+    assert!(stderr_str(&out).contains("1 error(s)"), "stderr: {}", stderr_str(&out));
+    let html = stdout_str(&out);
+    assert!(html.contains("id=\"imd-diag\"") && html.contains("IMD-101"), "{html}");
+}
+
+#[test]
+fn polish_quotations_survive_strip_notes() {
+    let dir = Scratch::new("polish_quote");
+    let md = dir.write("cytat.md", "> „Cytat z orzeczenia” — SN\n\n> Łukasz napisał: tak.\n\nTekst.\n".as_bytes());
+    let out = md2html().arg("--body").arg("--strip-notes").arg(&md).output().unwrap();
+    assert!(out.status.success());
+    let html = stdout_str(&out);
+    assert!(html.contains("„Cytat z orzeczenia”"), "{html}");
+    assert!(html.contains("Łukasz napisał"), "{html}");
 }

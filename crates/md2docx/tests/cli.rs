@@ -255,6 +255,83 @@ fn toc_marker_note_enables_table_of_contents() {
     assert!(text.contains("Table of Contents"), "no TOC generated: {text}");
 }
 
+// ---- ITA-MD conditional directives -----------------------------------------
+
+const ITAMD_SOURCE: &str = "# Umowa\n\n\
+> \u{1f500} \u{27e6}JEŻELI tier >= T4\u{27e7}\n\n\
+6. **Rekompensata SLA.** Według Załącznika D.\n\
+> \u{1f500} \u{27e6}KONIEC\u{27e7}\n\n\n\
+Zakres określa \u{27e6}JEŻELI tier >= T4\u{27e7}Załącznik D\u{27e6}W PRZECIWNYM RAZIE\u{27e7}Załącznik A\u{27e6}KONIEC\u{27e7}.\n";
+
+const WARNING: &str = "plik zawiera dyrektywy ITA-MD 1.0 — to źródło, nie egzemplarz; użyj kompilatora";
+
+#[test]
+fn itamd_source_is_stripped_with_a_warning() {
+    if !pandoc_available() {
+        eprintln!("SKIPPED: pandoc not installed");
+        return;
+    }
+    let dir = Scratch::new("itamd_strip");
+    let md = dir.write("umowa.md", ITAMD_SOURCE.as_bytes());
+    let out = md2docx().arg(&md).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_str(&out));
+    assert!(stderr_str(&out).contains(WARNING), "stderr: {}", stderr_str(&out));
+    let text = docx_text(&dir.path().join("umowa.docx"));
+    assert!(!text.contains('\u{27e6}') && !text.contains('\u{1f500}'), "directive leaked: {text}");
+    assert!(text.contains("Rekompensata SLA"), "every branch kept: {text}");
+    assert!(text.contains("Załącznik DZałącznik A"), "every branch kept: {text}");
+}
+
+#[test]
+fn final_refuses_an_uncompiled_itamd_source() {
+    // Refused before pandoc is looked for, so this runs everywhere.
+    let dir = Scratch::new("itamd_final");
+    let md = dir.write("umowa.md", ITAMD_SOURCE.as_bytes());
+    for extra in [&[][..], &["--keep-notes"][..]] {
+        let out = md2docx().arg(&md).arg("--final").args(extra).arg("--pandoc").arg("definitely-not-pandoc").output().unwrap();
+        assert!(!out.status.success());
+        let err = stderr_str(&out);
+        assert!(err.contains(WARNING), "stderr: {err}");
+        assert!(err.contains("REFUSING") && err.contains("ITA-MD directive"), "stderr: {err}");
+        assert!(!dir.path().join("umowa.docx").exists());
+    }
+}
+
+#[test]
+fn itamd_profile_compiles_before_converting() {
+    if !pandoc_available() {
+        eprintln!("SKIPPED: pandoc not installed");
+        return;
+    }
+    let dir = Scratch::new("itamd_profile");
+    let md = dir.write("umowa.md", ITAMD_SOURCE.as_bytes());
+    let facts = dir.write("t2.json", br#"{"tier": "T2"}"#);
+    let out = md2docx().arg(&md).arg("--itamd-profile").arg(&facts).arg("--final").output().unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_str(&out));
+    assert!(!stderr_str(&out).contains(WARNING), "a compiled text is not a source");
+    let text = docx_text(&dir.path().join("umowa.docx"));
+    assert!(text.contains("Zakres określa Załącznik A."), "{text}");
+    assert!(!text.contains("Załącznik D"), "{text}");
+    assert!(text.contains("Nie dotyczy niniejszej Umowy."), "stub expected: {text}");
+}
+
+#[test]
+fn itamd_problems_are_reported_before_pandoc_is_looked_for() {
+    let dir = Scratch::new("itamd_fail");
+    let md = dir.write("umowa.md", ITAMD_SOURCE.as_bytes());
+    let empty = dir.write("puste.json", b"{}");
+    let out = md2docx().arg(&md).arg("--itamd-profile").arg(&empty).arg("--pandoc").arg("definitely-not-pandoc").output().unwrap();
+    assert!(!out.status.success());
+    let err = stderr_str(&out);
+    assert!(err.contains("IMD-503"), "stderr: {err}");
+    assert!(!err.contains("pandoc"), "pandoc must not be reached: {err}");
+    let missing = md2docx().arg(&md).arg("--itamd-profile").arg(dir.path().join("brak.json")).output().unwrap();
+    assert!(!missing.status.success());
+    assert!(stderr_str(&missing).contains("IMD-506"));
+    let no_value = md2docx().arg(&md).arg("--itamd-profile").output().unwrap();
+    assert!(stderr_str(&no_value).contains("missing value for --itamd-profile"));
+}
+
 #[test]
 fn toc_flag_is_accepted() {
     if !pandoc_available() {

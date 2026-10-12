@@ -1,0 +1,38 @@
+{
+  "standard": "ITA-MD 1.0",
+  "nazwa": "przykład: fragment Cennika",
+  "opis": "Słownik faktów przykładu z rozdziału 19 podręcznika. Pełny słownik umów T1–T5 należy do projektu BAU.",
+  "fakty": {
+    "tier": {
+      "typ": "poziom",
+      "etykieta": "Poziom",
+      "opis": "Poziom usług Umowy T1–T5 (Załącznik F poz. F1)"
+    },
+    "reservation": {
+      "typ": "wyliczeniowy",
+      "wartości": ["L1", "L2", "L3", "L4"],
+      "etykieta": "rezerwacja godzin",
+      "opis": "Poziom rezerwacji godzin L1–L4 albo pusty (tylko T4)"
+    },
+    "hours": {
+      "typ": "logiczny",
+      "etykieta": "rozszerzone godziny",
+      "opis": "Wykupione rozszerzone godziny pracy wsparcia, dowolne okno"
+    },
+    "holidays": {
+      "typ": "logiczny",
+      "etykieta": "praca w święta",
+      "opis": "Pokrycie w dni ustawowo wolne od pracy (E5.1)"
+    },
+    "standby24": {
+      "typ": "logiczny",
+      "etykieta": "dyżur 24h",
+      "opis": "Całodobowy dyżur 24h (E5.2, E5.3)"
+    },
+    "demands": {
+      "typ": "logiczny",
+      "etykieta": "świadczenia na żądanie",
+      "opis": "Praca w święta albo dyżur 24h"
+    }
+  }
+}

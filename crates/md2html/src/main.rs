@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use md_core::{render, wrap_html, AssetMode, PageOptions, RenderOptions};
+use md_core::{itamd, render, wrap_html, AssetMode, PageOptions, RenderOptions};
 
 const USAGE: &str = "\
 md2html - convert Markdown to HTML (GFM, mermaid diagrams, syntax highlighting)
@@ -29,8 +29,18 @@ Options:
   --title TEXT     Page <title> (default: the input filename)
   --strip-notes    Remove source-only working notes before converting
                    (emoji-blockquote notes like \"> \u{1f7e2} **[DRAFTED]** ...\",
-                   HTML comments) - preview the document as a deliverable
+                   HTML comments, ITA-MD directives with every branch kept)
+                   - preview the document as a deliverable
+  --itamd-profile FACTS
+                   Compile the ITA-MD conditional directives for the
+                   configuration in FACTS (a JSON object of facts, or a
+                   generator manifest with a \"facts\" member); stubs are
+                   dimmed. Any ITA-MD error stops the conversion.
   -h, --help       Show this help
+
+A source with ITA-MD 1.0 directives (docs/ITA-MD) is shown annotated:
+conditions as framed regions and chips, with a show/hide switch. The fact
+vocabulary (itamd-slownik.json) is looked up from the input's folder upwards.
 
 Examples:
   md2html README.md -o README.html
@@ -47,6 +57,7 @@ fn main() -> ExitCode {
     let mut strip_notes = false;
     let mut save_next_to_input = false;
     let mut title: Option<String> = None;
+    let mut itamd_profile: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -67,6 +78,10 @@ fn main() -> ExitCode {
             "--title" => match args.next() {
                 Some(v) => title = Some(v),
                 None => return fail("missing value for --title"),
+            },
+            "--itamd-profile" => match args.next() {
+                Some(v) => itamd_profile = Some(PathBuf::from(v)),
+                None => return fail("missing value for --itamd-profile"),
             },
             _ if arg.starts_with('-') => {
                 return fail(&format!("unknown option: {arg}"));
@@ -111,10 +126,55 @@ fn main() -> ExitCode {
         }
     };
 
+    // ITA-MD: the project's fact vocabulary, found from the input's folder.
+    let (vocabulary, vocabulary_problems) = match &base_dir {
+        Some(dir) => itamd::vocabulary_for(dir),
+        None => (None, Vec::new()),
+    };
+
+    // --itamd-profile: compile the conditional directives for one
+    // configuration (fail closed: any ITA-MD error stops the conversion).
+    let markdown = match &itamd_profile {
+        Some(facts_path) => {
+            if !vocabulary_problems.is_empty() {
+                return fail_itamd(&vocabulary_problems);
+            }
+            let facts = match itamd::load_facts(facts_path) {
+                Ok(f) => f,
+                Err(problems) => return fail_itamd(&problems),
+            };
+            let options = itamd::CompileOptions { vocabulary: vocabulary.as_ref() };
+            match itamd::compile(&markdown, &facts, &options) {
+                Ok(compiled) => compiled.text,
+                Err(problems) => return fail_itamd(&problems),
+            }
+        }
+        None => markdown,
+    };
+
     // --strip-notes: preview the deliverable — drop the source-only working
-    // notes exactly the way md2docx does before compiling.
+    // notes exactly the way md2docx does. Without it a source is shown as a
+    // source: ITA-MD directives annotated, every branch visible.
     let markdown = if strip_notes {
-        md_core::strip_source_notes(&markdown).text
+        let stripped = md_core::strip_source_notes(&markdown);
+        if stripped.itamd_directives > 0 {
+            eprintln!("md2html: {}", itamd::WARNING_UNCOMPILED);
+        }
+        stripped.text
+    } else if itamd_profile.is_none() {
+        let annotated = itamd::annotate(
+            &markdown,
+            &itamd::AnnotateOptions {
+                vocabulary: vocabulary.as_ref(),
+                extra: vocabulary_problems,
+                ..Default::default()
+            },
+        );
+        let errors = annotated.diagnostics.iter().filter(|d| d.is_error()).count();
+        if errors > 0 {
+            eprintln!("md2html: ITA-MD: {errors} error(s) in the source (listed at the top of the page)");
+        }
+        annotated.markdown
     } else {
         markdown
     };
@@ -122,6 +182,9 @@ fn main() -> ExitCode {
     // Image paths are left as authored (they resolve relative to the output's
     // location in a normal browser) — matching MDView's --html behavior.
     let mut body = render(&markdown, &RenderOptions::default()).body;
+    if itamd_profile.is_some() {
+        body = itamd::dim_stubs(&body);
+    }
 
     // --embed: inline every local image as a data: URI so the page is fully
     // self-contained (openable from anywhere, no files needed next to it).
@@ -141,6 +204,7 @@ fn main() -> ExitCode {
                 title: title.as_deref().unwrap_or(&default_title),
                 assets: if embed { AssetMode::Embedded } else { AssetMode::Cdn },
                 extra_js: "",
+                itamd_hidden: false,
             },
         )
     };
@@ -198,5 +262,14 @@ fn inline_local_images(body: &str, base_dir: &std::path::Path) -> String {
 fn fail(msg: &str) -> ExitCode {
     eprintln!("md2html: {msg}");
     eprintln!("Try 'md2html --help'.");
+    ExitCode::FAILURE
+}
+
+/// Report ITA-MD problems (vocabulary, fact set, compilation) and fail.
+fn fail_itamd(problems: &[itamd::Diagnostic]) -> ExitCode {
+    for p in problems {
+        eprintln!("md2html: ITA-MD: {p}");
+    }
+    eprintln!("md2html: ITA-MD: nothing written (the compiler fails closed)");
     ExitCode::FAILURE
 }

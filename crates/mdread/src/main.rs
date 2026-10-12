@@ -14,11 +14,17 @@
 //! * live reload is just `location.reload()` — the handler re-reads the file,
 //! * images are served straight from disk with correct MIME types, however
 //!   many and however large they are.
+//!
+//! Sources with ITA-MD conditional directives are shown annotated (every
+//! branch visible, conditions as frames and chips, a "Warunki: pokaż /
+//! ukryj" switch that is remembered), and "Podgląd dla profilu…" compiles
+//! them for one configuration's fact set.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -31,13 +37,29 @@ use wry::WebViewBuilder;
 #[cfg(windows)]
 use wry::WebViewBuilderExtWindows;
 
+use md_core::itamd;
 use md_core::{percent_decode, percent_encode};
+
+/// ITA-MD view state shared by the event loop and the protocol handler.
+struct ItamdView {
+    /// "Warunki: ukryj": directive decorations hidden (persisted).
+    hidden: AtomicBool,
+    /// The fact set of an active "Podgląd dla profilu…" (session only).
+    profile: Mutex<Option<PathBuf>>,
+}
 
 /// Requests dispatched from the IPC/protocol threads to the event loop.
 #[derive(Debug)]
 enum UserEvent {
-    /// A page finished loading: apply the persisted zoom factor.
-    PageLoaded,
+    /// A page finished loading: apply the persisted zoom factor. Carries
+    /// what the page reported about its ITA-MD content (for smoke tests).
+    PageLoaded(String),
+    /// "Warunki: pokaż / ukryj" switched in the page toolbar.
+    ItamdHidden(bool),
+    /// "Podgląd dla profilu…": choose a fact set, show the compiled text.
+    ItamdChooseProfile,
+    /// Leave the compiled preview, back to the annotated source.
+    ItamdSource,
     /// The document on screen changed on disk: reload it.
     ReloadDocument,
     /// Show the file-open dialog and navigate to the chosen file.
@@ -86,9 +108,15 @@ Arguments:
   [FILE]      Markdown file to open (a file dialog is shown if omitted)
 
 Options:
-  --dark      Force dark mode
-  --light     Force light mode (default: follow the system setting)
-  -h, --help  Show this help
+  --dark                 Force dark mode
+  --light                Force light mode (default: follow the system setting)
+  --itamd-profile FACTS  Start in the compiled preview of ITA-MD directives for
+                         the configuration in FACTS (JSON fact set)
+  -h, --help             Show this help
+
+ITA-MD sources (conditional directives, docs/ITA-MD) are shown annotated: the
+toolbar switches the decorations on and off (remembered) and offers
+\"Podgląd dla profilu...\" to compile the source for one fact set.
 
 Keys:
   ESC                 close
@@ -103,7 +131,9 @@ Window position, size, maximized state, and zoom persist across sessions.
 fn main() {
     let mut file_arg: Option<PathBuf> = None;
     let mut force_dark: Option<bool> = None;
-    for arg in std::env::args().skip(1) {
+    let mut profile_arg: Option<PathBuf> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -111,6 +141,13 @@ fn main() {
             }
             "--dark" => force_dark = Some(true),
             "--light" => force_dark = Some(false),
+            "--itamd-profile" => match args.next() {
+                Some(v) => profile_arg = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("mdread: missing value for --itamd-profile\nTry 'mdread --help'.");
+                    std::process::exit(2);
+                }
+            },
             _ if arg.starts_with('-') => {
                 eprintln!("mdread: unknown option: {arg}\nTry 'mdread --help'.");
                 std::process::exit(2);
@@ -151,10 +188,18 @@ fn main() {
         },
     };
 
+    // A fact set given on the command line resolves against the working
+    // directory now; a missing file shows up as an error in the preview.
+    let profile_arg = profile_arg.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
     let config = load_config();
+    let itamd_view = Arc::new(ItamdView {
+        hidden: AtomicBool::new(config.itamd_hidden),
+        profile: Mutex::new(profile_arg),
+    });
 
     let title = format!(
         "{} - mdread",
@@ -181,30 +226,17 @@ fn main() {
     // ---- custom protocol: pages, document files, bundled assets ------------
     let handler_doc = current_doc.clone();
     let handler_proxy = proxy.clone();
+    let handler_view = itamd_view.clone();
     let protocol = move |_id: wry::WebViewId, request: Request<Vec<u8>>| -> Response<Cow<'static, [u8]>> {
         #[cfg(debug_assertions)]
         eprintln!("[mdread] protocol request: {}", request.uri());
-        serve(&request, dark_mode, &handler_doc, &handler_proxy)
+        serve(&request, dark_mode, &handler_doc, &handler_proxy, &handler_view)
     };
 
     // ---- IPC: keyboard/zoom/link glue from the injected script -------------
     let ipc_proxy = proxy.clone();
     let ipc = move |request: Request<String>| {
-        let msg = request.body().as_str();
-        let event = if let Some(url) = msg.strip_prefix("open-external:") {
-            Some(UserEvent::OpenExternal(url.to_string()))
-        } else {
-            match msg {
-                "loaded" => Some(UserEvent::PageLoaded),
-                "open-dialog" => Some(UserEvent::OpenDialog),
-                "zoom-in" => Some(UserEvent::ZoomIn),
-                "zoom-out" => Some(UserEvent::ZoomOut),
-                "zoom-reset" => Some(UserEvent::ZoomReset),
-                "close" => Some(UserEvent::Close),
-                _ => None,
-            }
-        };
-        if let Some(event) = event {
+        if let Some(event) = parse_ipc(request.body()) {
             let _ = ipc_proxy.send_event(event);
         }
     };
@@ -274,7 +306,7 @@ fn main() {
         match event {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
-                    persist_state(&window, zoom, win_geom);
+                    persist_state(&window, zoom, win_geom, itamd_view.hidden.load(Ordering::Relaxed));
                     *control_flow = ControlFlow::Exit;
                 }
                 WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
@@ -296,14 +328,32 @@ fn main() {
                 _ => {}
             },
             Event::UserEvent(user) => match user {
-                UserEvent::PageLoaded => {
+                UserEvent::PageLoaded(report) => {
                     if smoke_test {
-                        eprintln!("mdread: smoke test OK (page loaded)");
+                        eprintln!("mdread: smoke test OK (page loaded; {report})");
                         std::process::exit(0);
                     }
                     if (zoom - 1.0).abs() > f64::EPSILON {
                         let _ = webview.zoom(zoom);
                     }
+                }
+                UserEvent::ItamdHidden(hidden) => {
+                    itamd_view.hidden.store(hidden, Ordering::Relaxed);
+                    persist_state(&window, zoom, win_geom, hidden);
+                }
+                UserEvent::ItamdChooseProfile => {
+                    let chosen = rfd::FileDialog::new()
+                        .set_title("Podgląd dla profilu: plik faktów ITA-MD")
+                        .add_filter("Fakty ITA-MD (JSON)", &["json"])
+                        .pick_file();
+                    if let Some(path) = chosen {
+                        *itamd_view.profile.lock().unwrap() = Some(path);
+                        let _ = webview.evaluate_script("location.reload()");
+                    }
+                }
+                UserEvent::ItamdSource => {
+                    *itamd_view.profile.lock().unwrap() = None;
+                    let _ = webview.evaluate_script("location.reload()");
                 }
                 UserEvent::ReloadDocument => {
                     let _ = webview.evaluate_script("location.reload()");
@@ -324,26 +374,48 @@ fn main() {
                 UserEvent::ZoomIn => {
                     zoom = (zoom * 1.1).min(5.0);
                     let _ = webview.zoom(zoom);
-                    persist_state(&window, zoom, win_geom);
+                    persist_state(&window, zoom, win_geom, itamd_view.hidden.load(Ordering::Relaxed));
                 }
                 UserEvent::ZoomOut => {
                     zoom = (zoom / 1.1).max(0.25);
                     let _ = webview.zoom(zoom);
-                    persist_state(&window, zoom, win_geom);
+                    persist_state(&window, zoom, win_geom, itamd_view.hidden.load(Ordering::Relaxed));
                 }
                 UserEvent::ZoomReset => {
                     zoom = 1.0;
                     let _ = webview.zoom(zoom);
-                    persist_state(&window, zoom, win_geom);
+                    persist_state(&window, zoom, win_geom, itamd_view.hidden.load(Ordering::Relaxed));
                 }
                 UserEvent::Close => {
-                    persist_state(&window, zoom, win_geom);
+                    persist_state(&window, zoom, win_geom, itamd_view.hidden.load(Ordering::Relaxed));
                     *control_flow = ControlFlow::Exit;
                 }
             },
             _ => {}
         }
     });
+}
+
+/// Translate a message from the page script into an event-loop request.
+fn parse_ipc(msg: &str) -> Option<UserEvent> {
+    if let Some(url) = msg.strip_prefix("open-external:") {
+        return Some(UserEvent::OpenExternal(url.to_string()));
+    }
+    if let Some(report) = msg.strip_prefix("loaded") {
+        return Some(UserEvent::PageLoaded(report.trim_start_matches(':').to_string()));
+    }
+    match msg {
+        "open-dialog" => Some(UserEvent::OpenDialog),
+        "zoom-in" => Some(UserEvent::ZoomIn),
+        "zoom-out" => Some(UserEvent::ZoomOut),
+        "zoom-reset" => Some(UserEvent::ZoomReset),
+        "close" => Some(UserEvent::Close),
+        "itamd-ukryj" => Some(UserEvent::ItamdHidden(true)),
+        "itamd-pokaz" => Some(UserEvent::ItamdHidden(false)),
+        "itamd-profil" => Some(UserEvent::ItamdChooseProfile),
+        "itamd-zrodlo" => Some(UserEvent::ItamdSource),
+        _ => None,
+    }
 }
 
 /// Serve one request of the `mdfiles` protocol.
@@ -360,6 +432,7 @@ fn serve(
     dark_mode: bool,
     current_doc: &Arc<Mutex<PathBuf>>,
     proxy: &tao::event_loop::EventLoopProxy<UserEvent>,
+    itamd_view: &ItamdView,
 ) -> Response<Cow<'static, [u8]>> {
     let uri = request.uri();
     let path = uri.path();
@@ -368,7 +441,7 @@ fn serve(
         let Some(doc) = uri.query().and_then(query_path) else {
             return not_found("missing p= query parameter");
         };
-        return match render_page(&doc, dark_mode) {
+        return match render_page(&doc, dark_mode, itamd_view) {
             Ok(html) => {
                 *current_doc.lock().unwrap() = doc.clone();
                 let name = doc
@@ -445,10 +518,12 @@ fn query_path(query: &str) -> Option<PathBuf> {
 }
 
 /// Render one markdown file into a complete HTML page.
-fn render_page(doc: &Path, dark_mode: bool) -> std::io::Result<String> {
-    let markdown = std::fs::read_to_string(doc)?;
+fn render_page(doc: &Path, dark_mode: bool, itamd_view: &ItamdView) -> std::io::Result<String> {
+    let source = std::fs::read_to_string(doc)?;
     let base_dir = md_core::doc_base_dir(doc)
         .ok_or_else(|| std::io::Error::other("document has no parent folder"))?;
+    let profile = itamd_view.profile.lock().unwrap().clone();
+    let (markdown, compiled) = itamd_view_of(&source, &base_dir, profile.as_deref());
 
     // Image URLs carry their serve root: /root/<encoded root>/<rel…>.
     let serve_root = md_core::serve_root_for(&markdown, &base_dir);
@@ -476,15 +551,64 @@ fn render_page(doc: &Path, dark_mode: bool) -> std::io::Result<String> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Markdown".to_string());
 
+    // A compiled preview reads its "not applicable" stubs as secondary text.
+    let body = if compiled { itamd::dim_stubs(&rendered.body) } else { rendered.body };
+
     Ok(md_core::wrap_html(
-        &rendered.body,
+        &body,
         &md_core::PageOptions {
             dark_mode,
             title: &title,
             assets: md_core::AssetMode::BaseUrl(format!("{}/assets", proto_base())),
             extra_js: "",
+            itamd_hidden: itamd_view.hidden.load(Ordering::Relaxed),
         },
     ))
+}
+
+/// What the reader shows of a source: the annotated source (directives as
+/// frames and chips, every branch visible), or — with a fact set chosen in
+/// "Podgląd dla profilu…" — the text compiled for that configuration under a
+/// preview toolbar. A preview that cannot compile shows its errors above the
+/// annotated source. Returns the Markdown to render and whether it is a
+/// compiled text.
+fn itamd_view_of(source: &str, base_dir: &Path, profile: Option<&Path>) -> (String, bool) {
+    let (vocabulary, vocabulary_problems) = itamd::vocabulary_for(base_dir);
+    let Some(facts_path) = profile else {
+        let annotated = itamd::annotate(
+            source,
+            &itamd::AnnotateOptions { vocabulary: vocabulary.as_ref(), extra: vocabulary_problems, bare: false },
+        );
+        return (annotated.markdown, false);
+    };
+    let name = facts_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| facts_path.display().to_string());
+    let compiled = if vocabulary_problems.is_empty() {
+        itamd::load_facts(facts_path).and_then(|facts| {
+            itamd::compile(source, &facts, &itamd::CompileOptions { vocabulary: vocabulary.as_ref() })
+        })
+    } else {
+        Err(vocabulary_problems)
+    };
+    match compiled {
+        Ok(c) => (format!("{}\n\n{}", itamd::preview_toolbar(&name, Ok(c.stubs)), c.text), true),
+        Err(problems) => {
+            let errors = problems.iter().filter(|d| d.is_error()).count();
+            let annotated = itamd::annotate(
+                source,
+                &itamd::AnnotateOptions { vocabulary: vocabulary.as_ref(), extra: Vec::new(), bare: true },
+            );
+            let page = format!(
+                "{}\n\n{}\n\n{}",
+                itamd::preview_toolbar(&name, Err(errors)),
+                itamd::diagnostics_panel(&problems),
+                annotated.markdown
+            );
+            (page, false)
+        }
+    }
 }
 
 fn respond(bytes: Vec<u8>, mime: &str) -> Response<Cow<'static, [u8]>> {
@@ -521,11 +645,13 @@ struct Config {
     zoom: f64,
     window: Option<WindowGeom>,
     maximized: bool,
+    /// ITA-MD "Warunki: ukryj": directive decorations hidden.
+    itamd_hidden: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { zoom: 1.0, window: None, maximized: false }
+        Config { zoom: 1.0, window: None, maximized: false, itamd_hidden: false }
     }
 }
 
@@ -561,6 +687,8 @@ fn parse_config(text: &str) -> Config {
             }
         } else if let Some(v) = line.strip_prefix("maximized=") {
             cfg.maximized = v.trim() == "1";
+        } else if let Some(v) = line.strip_prefix("itamd_hidden=") {
+            cfg.itamd_hidden = v.trim() == "1";
         }
     }
     cfg
@@ -581,6 +709,7 @@ fn serialize_config(cfg: &Config) -> String {
         out.push_str(&format!("window={x},{y},{w},{h}\n"));
     }
     out.push_str(&format!("maximized={}\n", u8::from(cfg.maximized)));
+    out.push_str(&format!("itamd_hidden={}\n", u8::from(cfg.itamd_hidden)));
     out
 }
 
@@ -596,7 +725,7 @@ fn save_config(cfg: &Config) {
 /// last geometry tracked from Moved/Resized events; if none arrived yet the
 /// window is queried directly (unless maximized, where the query would return
 /// the maximized rectangle instead of the state to restore to).
-fn persist_state(window: &Window, zoom: f64, geom: Option<WindowGeom>) {
+fn persist_state(window: &Window, zoom: f64, geom: Option<WindowGeom>, itamd_hidden: bool) {
     let maximized = window.is_maximized();
     let mut geom = geom;
     if geom.is_none() && !maximized {
@@ -605,7 +734,7 @@ fn persist_state(window: &Window, zoom: f64, geom: Option<WindowGeom>) {
             geom = sane_geometry(pos.x, pos.y, size.width, size.height);
         }
     }
-    save_config(&Config { zoom, window: geom, maximized });
+    save_config(&Config { zoom, window: geom, maximized, itamd_hidden });
 }
 
 // ---- the glue script injected into every page ------------------------------
@@ -629,7 +758,11 @@ const GLUE_JS: &str = r#"
       var y = sessionStorage.getItem(skey());
       if (y && !location.hash) window.scrollTo(0, parseInt(y, 10));
     } catch (e) {}
-    try { window.ipc.postMessage('loaded'); } catch (e) {}
+    // The load report names what the WebView actually rendered of ITA-MD
+    // (chips of an annotated source, dimmed stubs of a compiled preview).
+    var chips = document.querySelectorAll('.imd-chip').length;
+    var stubs = document.querySelectorAll('.imd-nd').length;
+    try { window.ipc.postMessage('loaded:itamd-chips=' + chips + ',itamd-stubs=' + stubs); } catch (e) {}
   });
   document.addEventListener('click', function(e){
     var link = e.target && e.target.closest ? e.target.closest('a') : null;
@@ -742,11 +875,52 @@ mod tests {
 
     #[test]
     fn test_config_roundtrips_through_serialize() {
-        let cfg = Config { zoom: 1.331, window: Some((-8, 42, 1920, 1042)), maximized: false };
+        let cfg = Config { zoom: 1.331, window: Some((-8, 42, 1920, 1042)), maximized: false, itamd_hidden: true };
         assert_eq!(parse_config(&serialize_config(&cfg)), cfg);
 
-        let cfg = Config { zoom: 1.0, window: None, maximized: true };
+        let cfg = Config { zoom: 1.0, window: None, maximized: true, itamd_hidden: false };
         assert_eq!(parse_config(&serialize_config(&cfg)), cfg);
+    }
+
+    #[test]
+    fn test_parse_config_itamd_hidden() {
+        assert!(parse_config("itamd_hidden=1\n").itamd_hidden);
+        assert!(!parse_config("itamd_hidden=0\n").itamd_hidden);
+        // Configs written before the setting existed keep decorations shown.
+        assert!(!parse_config("zoom=1.000\nmaximized=0\n").itamd_hidden);
+    }
+
+    #[test]
+    fn test_parse_ipc_messages() {
+        assert!(matches!(parse_ipc("loaded"), Some(UserEvent::PageLoaded(r)) if r.is_empty()));
+        assert!(matches!(
+            parse_ipc("loaded:itamd-chips=3,itamd-stubs=0"),
+            Some(UserEvent::PageLoaded(r)) if r == "itamd-chips=3,itamd-stubs=0"
+        ));
+        assert!(matches!(parse_ipc("itamd-ukryj"), Some(UserEvent::ItamdHidden(true))));
+        assert!(matches!(parse_ipc("itamd-pokaz"), Some(UserEvent::ItamdHidden(false))));
+        assert!(matches!(parse_ipc("itamd-profil"), Some(UserEvent::ItamdChooseProfile)));
+        assert!(matches!(parse_ipc("itamd-zrodlo"), Some(UserEvent::ItamdSource)));
+        assert!(matches!(parse_ipc("open-external:https://x"), Some(UserEvent::OpenExternal(u)) if u == "https://x"));
+        assert!(parse_ipc("something-else").is_none());
+    }
+
+    #[test]
+    fn test_itamd_view_annotates_and_previews() {
+        let dir = std::env::temp_dir().join("mdread_itamd_view_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "> 🔀 ⟦JEŻELI ef⟧\n\n6. **Punkt.** treść\n> 🔀 ⟦KONIEC⟧\n";
+        let (annotated, compiled) = itamd_view_of(src, &dir, None);
+        assert!(!compiled && annotated.contains("imd-pasek") && annotated.contains("imd-blok"));
+        std::fs::write(dir.join("f.json"), r#"{"ef": false}"#).unwrap();
+        let (preview, compiled) = itamd_view_of(src, &dir, Some(&dir.join("f.json")));
+        assert!(compiled, "{preview}");
+        assert!(preview.contains("Podgląd egzemplarza") && preview.contains("6. Nie dotyczy niniejszej Umowy."));
+        // A preview that cannot compile shows why, above the source.
+        let (failed, compiled) = itamd_view_of(src, &dir, Some(&dir.join("missing.json")));
+        assert!(!compiled && failed.contains("podgląd niemożliwy") && failed.contains("IMD-506") && failed.contains("imd-blok"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

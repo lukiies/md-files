@@ -1,0 +1,8 @@
+{
+  "tier": "T3",
+  "reservation": "",
+  "hours": false,
+  "holidays": true,
+  "standby24": false,
+  "demands": true
+}

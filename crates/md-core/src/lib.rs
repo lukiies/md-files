@@ -16,10 +16,17 @@
 //!   mermaid/highlight libraries pulled from a CDN, embedded inline, or served
 //!   from a caller-controlled base URL — libraries are only included when the
 //!   document actually needs them.
+//! * the source/deliverable convention: working notes are stripped from
+//!   deliverables ([`strip_source_notes`]), and ITA-MD conditional
+//!   directives are checked, annotated for viewers, or stripped ([`itamd`]).
 
 use std::path::{Component, Path, PathBuf};
 
 use pulldown_cmark::{html, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+pub mod itamd;
+pub mod json;
+mod source;
 
 /// The bundled JS/CSS assets, embedded at compile time so every tool in the
 /// suite can work fully offline.
@@ -76,7 +83,7 @@ pub struct Rendered {
 }
 
 /// The pulldown-cmark options every conversion in the suite uses.
-fn md_options() -> Options {
+pub(crate) fn md_options() -> Options {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_FOOTNOTES);
@@ -464,11 +471,14 @@ pub struct PageOptions<'a> {
     /// interception, scroll persistence, keyboard shortcuts). Empty for plain
     /// CLI output.
     pub extra_js: &'a str,
+    /// Start with ITA-MD decorations hidden (the "Warunki: ukryj" state of
+    /// an annotated page; see [`itamd::annotate`]).
+    pub itamd_hidden: bool,
 }
 
 impl<'a> Default for PageOptions<'a> {
     fn default() -> Self {
-        Self { dark_mode: false, title: "Markdown", assets: AssetMode::Cdn, extra_js: "" }
+        Self { dark_mode: false, title: "Markdown", assets: AssetMode::Cdn, extra_js: "", itamd_hidden: false }
     }
 }
 
@@ -549,12 +559,21 @@ pub fn wrap_html(content: &str, opts: &PageOptions) -> String {
         ));
     }
 
+    // ITA-MD decorations (frames, chips, the show/hide toolbar) only when the
+    // body is an annotated source.
+    let (itamd_css, itamd_js) = if content.contains("class=\"imd-") {
+        (itamd::page_css(dark_mode, border_color), format!("<script>{}</script>\n", itamd::PAGE_JS))
+    } else {
+        (String::new(), String::new())
+    };
+    let html_class = if opts.itamd_hidden { " class=\"imd-ukryj\"" } else { "" };
+
     let title = escape_html(opts.title);
     let extra_js = opts.extra_js;
 
     format!(
         r#"<!DOCTYPE html>
-<html>
+<html{html_class}>
 <head>
 <meta charset="UTF-8">
 <title>{title}</title>
@@ -633,11 +652,13 @@ input[type="checkbox"] {{
     margin-right: 0.5em;
 }}
 {hljs_theme_css}
+{itamd_css}
 </style>
 </head>
 <body>
 {content}
 {feature_scripts}
+{itamd_js}
 {extra_js}
 </body>
 </html>"#
@@ -655,6 +676,9 @@ pub struct StrippedSource {
     pub wants_figures_list: bool,
     /// A `[LIST OF TABLES]` marker note was present.
     pub wants_tables_list: bool,
+    /// ITA-MD directives removed (all branches kept). Non-zero means the
+    /// result is a source's text, not a compiled deliverable.
+    pub itamd_directives: usize,
 }
 
 /// Strip source-only annotations from a markdown document.
@@ -663,32 +687,49 @@ pub struct StrippedSource {
 /// editable SOURCE and may carry visible working notes; the converted output
 /// is the DELIVERABLE and must not contain them. Removed:
 ///
-/// * emoji-blockquote notes — a blockquote whose first line starts with a
-///   character outside Latin-1 (`> 🟢 **[DRAFTED]** …`, `> 🟠 **[EXPANSION
+/// * ITA-MD directives ([`itamd::strip_directives`]): block and table
+///   directive lines with the blank line after each, inline and row
+///   directives — every branch's text is kept;
+/// * emoji-blockquote notes — a blockquote whose first line starts with an
+///   emoji ([`is_emoji`]): `> 🟢 **[DRAFTED]** …`, `> 🟠 **[EXPANSION
 ///   NOTE]** …`, `> 📝 **[WORKING NOTE]** …`, `> 🖼️ **[FIGURE NOTE]** …`,
-///   `> 📋 **[SOURCE NOTE]** …`, and any future `> <emoji> **[LABEL]**`
-///   marker). The whole blockquote goes, continuation lines included.
-///   Ordinary blockquotes (first character in Latin-1) are kept.
+///   `> 📋 **[SOURCE NOTE]** …`, `> 🔀 …`, and any future
+///   `> <emoji> **[LABEL]**` marker. The whole blockquote goes, continuation
+///   lines included. Ordinary blockquotes are kept — including quotations
+///   that open with a Polish letter (`> Łukasz …`) or a quotation mark
+///   (`> „Cytat…”`).
 /// * HTML comments `<!-- … -->`, including multi-line ones.
 /// * legacy bare `[DRAFTED…]` / `[EXPANSION NOTE…]` lines.
+///
+/// Nothing inside code blocks or code spans is touched: a document that
+/// shows a note or a directive as an example keeps the example.
 ///
 /// Marker notes `[TABLE OF CONTENTS]` / `[TABLE OF FIGURES]` /
 /// `[LIST OF TABLES]` are stripped like any other note but reported through
 /// the returned flags so a converter can act on them (e.g. pass `--toc` to
-/// pandoc). Runs of three or more newlines left behind by the removals are
-/// collapsed to a blank line.
+/// pandoc). Runs of blank lines left behind by the removals are collapsed to
+/// one blank line (outside code).
 pub fn strip_source_notes(markdown: &str) -> StrippedSource {
     let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
-    let no_comments = strip_html_comments(markdown);
+    let (no_directives, itamd_directives) = itamd::strip_counted(markdown);
+    let no_comments = strip_html_comments(&no_directives);
+    let layout = source::Layout::of(&no_comments);
 
-    let mut out_lines: Vec<&str> = Vec::new();
+    // Kept lines, each with "is it inside code".
+    let mut kept: Vec<(&str, bool)> = Vec::new();
     let mut in_note = false;
     let mut wants_toc = false;
     let mut wants_figures_list = false;
     let mut wants_tables_list = false;
 
-    for line in no_comments.lines() {
-        let stripped = line.trim();
+    for line in source::lines(&no_comments) {
+        let stripped = line.text.trim();
+        let lead = line.text.len() - line.text.trim_start().len();
+        if layout.is_block_excluded(line.start + lead) {
+            in_note = false;
+            kept.push((line.text, true));
+            continue;
+        }
         if in_note {
             if stripped.starts_with('>') {
                 continue; // still inside the note blockquote
@@ -709,52 +750,105 @@ pub fn strip_source_notes(markdown: &str) -> StrippedSource {
         if stripped.starts_with("[DRAFTED") || stripped.starts_with("[EXPANSION NOTE") {
             continue;
         }
-        out_lines.push(line);
+        kept.push((line.text, false));
     }
 
-    let mut text = out_lines.join("\n");
-    while text.contains("\n\n\n") {
-        text = text.replace("\n\n\n", "\n\n");
+    // Collapse runs of empty lines outside code to a single blank line.
+    let mut out_lines: Vec<&str> = Vec::with_capacity(kept.len());
+    let mut prev_empty = false;
+    for (text, in_code) in kept {
+        let empty = text.is_empty() && !in_code;
+        if empty && prev_empty {
+            continue;
+        }
+        prev_empty = empty;
+        out_lines.push(text);
     }
-    StrippedSource { text, wants_toc, wants_figures_list, wants_tables_list }
+    let text = out_lines.join("\n");
+    StrippedSource { text, wants_toc, wants_figures_list, wants_tables_list, itamd_directives }
+}
+
+/// True if `c` is an emoji: the marker character that opens a working note
+/// (`> 🟢 …`, `> 📝 …`, `> ⚠️ …`, `> 🔀 …`). Letters of any alphabet,
+/// quotation marks, dashes and other punctuation are not emoji, so a
+/// quotation such as `> „Cytat…”` or `> Łukasz …` stays an ordinary
+/// blockquote.
+pub fn is_emoji(c: char) -> bool {
+    matches!(
+        c as u32,
+        // Pictographs, emoticons, transport and map symbols, geometric
+        // shapes extended (🟢 🟠), supplemental symbols and pictographs (🧭)
+        // and the other emoji blocks of the supplementary plane (🔀 U+1F500).
+        0x1F000..=0x1FAFF
+            // Miscellaneous symbols (⚠ ⚖ ☑) and dingbats (✅ ✏ ❗).
+            | 0x2600..=0x27BF
+            // Miscellaneous technical (⌛ ⏰ ⏳), symbols and arrows (⭐ ⬛ ⭕).
+            | 0x2300..=0x23FF
+            | 0x2B00..=0x2BFF
+            // Single emoji of other blocks: ‼ ⁉ ℹ Ⓜ ▪ ▫ ▶ ◀ ◻–◾ 〰 〽 ㊗ ㊙.
+            | 0x203C
+            | 0x2049
+            | 0x2139
+            | 0x24C2
+            | 0x25AA
+            | 0x25AB
+            | 0x25B6
+            | 0x25C0
+            | 0x25FB..=0x25FE
+            | 0x3030
+            | 0x303D
+            | 0x3297
+            | 0x3299
+    )
 }
 
 /// True if a trimmed line opens a source-note blockquote: `>` followed
-/// (after optional spaces) by a character outside Latin-1 — in practice an
-/// emoji marker like 🟢/🟠/📝/🖼️/📋/🧭.
+/// (after optional spaces) by an emoji marker like 🟢/🟠/📝/🖼️/📋/🧭, or the
+/// 🔀 of an ITA-MD block directive.
 fn is_note_open(stripped: &str) -> bool {
     stripped
         .strip_prefix('>')
         .map(|rest| {
-            matches!(rest.trim_start().chars().next(), Some(c) if c as u32 > 0xff)
+            let first = rest.trim_start().chars().next();
+            first == Some(itamd::DIRECTIVE_EMOJI) || matches!(first, Some(c) if is_emoji(c))
         })
         .unwrap_or(false)
 }
 
-/// Remove `<!-- … -->` comments (multi-line included); a newline directly
-/// after a comment goes with it so no stray blank line is left behind.
+/// Remove `<!-- … -->` comments (multi-line included) outside code; a
+/// newline directly after a comment goes with it so no stray blank line is
+/// left behind.
 fn strip_html_comments(text: &str) -> String {
+    let layout = source::Layout::of(text);
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("<!--") {
-        out.push_str(&rest[..start]);
-        match rest[start..].find("-->") {
+    let mut copied = 0; // text[..copied] is already handled
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("<!--") {
+        let start = from + rel;
+        if layout.is_code(start) {
+            from = start + 4;
+            continue;
+        }
+        out.push_str(&text[copied..start]);
+        match text[start..].find("-->") {
             Some(end_rel) => {
-                let mut after = &rest[start + end_rel + 3..];
-                if let Some(a) = after.strip_prefix("\r\n") {
-                    after = a;
-                } else if let Some(a) = after.strip_prefix('\n') {
-                    after = a;
+                let mut after = start + end_rel + 3;
+                if text[after..].starts_with("\r\n") {
+                    after += 2;
+                } else if text[after..].starts_with('\n') {
+                    after += 1;
                 }
-                rest = after;
+                copied = after;
+                from = after;
             }
             None => {
                 // Unterminated comment: drop to end of input.
-                rest = "";
+                copied = text.len();
+                break;
             }
         }
     }
-    out.push_str(rest);
+    out.push_str(&text[copied..]);
     out
 }
 
@@ -1043,6 +1137,80 @@ mod tests {
         let md = "a\n\n> 📝 **[WORKING NOTE]** x\n\n\nb\n";
         let s = strip_source_notes(md);
         assert!(!s.text.contains("\n\n\n"), "got: {:?}", s.text);
+    }
+
+    #[test]
+    fn test_strip_notes_keeps_polish_quotations() {
+        // Before the emoji-range rule any first character above U+00FF made
+        // a note, so these quotations were silently dropped.
+        for quote in [
+            "> „Cytat z orzeczenia” — SN",
+            "> Łukasz Robak napisał:",
+            "> Żaden zapis nie wiąże.",
+            "> Ść… ź",
+            "> “English quote”",
+            "> — myślnik na początku",
+            "> …wielokropek",
+            "> Ωmega i Кириллица",
+            "> → strzałka",
+        ] {
+            let md = format!("{quote}\n> druga linia\n\ntekst\n");
+            let s = strip_source_notes(&md);
+            assert!(s.text.contains(quote), "{quote:?} was stripped: {:?}", s.text);
+            assert!(s.text.contains("druga linia"));
+        }
+    }
+
+    #[test]
+    fn test_is_emoji_ranges() {
+        for c in ['🟢', '🟠', '📝', '🖼', '📋', '🧭', '🗂', '📑', '🔀', '⚠', '⚖', '✅', '❗', '⭐', '⏳', 'ℹ', '☑'] {
+            assert!(is_emoji(c), "{c} should be an emoji");
+        }
+        for c in ['„', '“', '”', 'Ł', 'ż', 'Ś', '—', '–', '…', '→', 'Ω', 'К', '中', '«', 'A', '1', '⟦', '·', '§'] {
+            assert!(!is_emoji(c), "{c} should not be an emoji");
+        }
+    }
+
+    #[test]
+    fn test_strip_notes_emoji_with_variation_selector_and_directive_note() {
+        let md = "> ⚠️ **[RISK NOTE]** check\n\n> 🔀 not a directive at all\n\nkept\n";
+        let s = strip_source_notes(md);
+        assert!(!s.text.contains("RISK") && !s.text.contains("not a directive"), "got: {}", s.text);
+        assert!(s.text.contains("kept"));
+    }
+
+    #[test]
+    fn test_strip_notes_never_touches_code() {
+        let md = "Przykład:\n\n```markdown\n> 📝 **[WORKING NOTE]** w przykładzie\n<!-- komentarz w przykładzie -->\n> 🔀 ⟦JEŻELI tier >= T4⟧\n\n\n\nkoniec przykładu\n```\n\nInline `<!-- x -->` i `> 📝` zostają.\n\n<!-- prawdziwy komentarz -->\n> 📝 **[WORKING NOTE]** prawdziwa notatka\n\nkoniec\n";
+        let s = strip_source_notes(md);
+        assert!(s.text.contains("> 📝 **[WORKING NOTE]** w przykładzie"), "got: {}", s.text);
+        assert!(s.text.contains("<!-- komentarz w przykładzie -->"));
+        assert!(s.text.contains("> 🔀 ⟦JEŻELI tier >= T4⟧\n\n\n\nkoniec przykładu"), "blank lines in code kept: {}", s.text);
+        assert!(s.text.contains("`<!-- x -->`"));
+        assert!(!s.text.contains("prawdziwy komentarz"));
+        assert!(!s.text.contains("prawdziwa notatka"));
+        assert_eq!(s.itamd_directives, 0);
+    }
+
+    #[test]
+    fn test_strip_notes_removes_itamd_directives() {
+        // A directive line leaves together with ONE blank line after it, so a
+        // blank line meant to stay after a block is written as a second one.
+        let md = "Przed.\n\n> 🔀 ⟦JEŻELI tier >= T4⟧\n\n6. Punkt ⟦JEŻELI ef⟧z EF⟦KONIEC⟧.\n> 🔀 ⟦KONIEC⟧\n\n\nPo.\n";
+        let s = strip_source_notes(md);
+        assert_eq!(s.text, "Przed.\n\n6. Punkt z EF.\n\nPo.");
+        assert_eq!(s.itamd_directives, 4);
+    }
+
+    #[test]
+    fn test_wrap_includes_itamd_assets_only_for_annotated_bodies() {
+        let a = itamd::annotate("> 🔀 ⟦JEŻELI ef⟧\n\n6. x\n> 🔀 ⟦KONIEC⟧\n", &itamd::AnnotateOptions::default());
+        let body = markdown_to_html(&a.markdown, None);
+        let page = wrap_html(&body, &PageOptions { itamd_hidden: true, ..Default::default() });
+        assert!(page.contains("<html class=\"imd-ukryj\">"));
+        assert!(page.contains(".imd-gal") && page.contains("itamd-ukryj"));
+        let plain = wrap_html(&markdown_to_html("# x", None), &PageOptions::default());
+        assert!(!plain.contains(".imd-gal") && plain.contains("<html>"));
     }
 
     #[test]
